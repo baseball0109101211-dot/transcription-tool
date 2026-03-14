@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>文字起こしツール</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+
+    <div class="container">
+        <!-- ── Header ── -->
+        <header class="header">
+            <div class="header-icon">🎙️</div>
+            <h1>文字起こしツール</h1>
+            <p>音声・動画ファイルをドラッグ＆ドロップで<br>AIがテキストに変換します</p>
+        </header>
+
+        <!-- ── Drop Zone ── -->
+        <div class="drop-zone" id="dropZone">
+            <span class="drop-zone-icon">📂</span>
+            <div class="drop-zone-text">ファイルをドラッグ＆ドロップ</div>
+            <div class="drop-zone-subtext">またはクリックして選択（複数OK）</div>
+            <div class="drop-zone-formats">
+                <span class="format-badge">MP3</span>
+                <span class="format-badge">WAV</span>
+                <span class="format-badge">M4A</span>
+                <span class="format-badge">MP4</span>
+                <span class="format-badge">MOV</span>
+                <span class="format-badge">AVI</span>
+                <span class="format-badge">MKV</span>
+                <span class="format-badge">WEBM</span>
+            </div>
+            <input type="file" class="file-input" id="fileInput" multiple
+                accept=".mp3,.wav,.m4a,.ogg,.flac,.wma,.aac,.mp4,.mov,.avi,.mkv,.webm,.wmv,.flv">
+        </div>
+
+        <!-- ── Selected Files List ── -->
+        <div class="file-list" id="fileList"></div>
+
+        <!-- ── Model Selector ── -->
+        <div class="model-selector" id="modelSelector">
+            <label class="model-label">⚡ 処理速度</label>
+            <div class="model-options">
+                <label class="model-option">
+                    <input type="radio" name="model" value="tiny">
+                    <span class="model-chip">最速<small>精度△</small></span>
+                </label>
+                <label class="model-option">
+                    <input type="radio" name="model" value="base" checked>
+                    <span class="model-chip">高速<small>おすすめ</small></span>
+                </label>
+                <label class="model-option">
+                    <input type="radio" name="model" value="small">
+                    <span class="model-chip">バランス<small>精度○</small></span>
+                </label>
+                <label class="model-option">
+                    <input type="radio" name="model" value="medium">
+                    <span class="model-chip">高精度<small>遅め</small></span>
+                </label>
+            </div>
+        </div>
+
+        <!-- ── Submit Button ── -->
+        <button class="submit-btn" id="submitBtn">
+            ✨ 文字起こしを開始
+        </button>
+
+        <!-- ── Upload Progress ── -->
+        <div class="upload-progress" id="uploadProgress">
+            <div class="upload-progress-header">
+                <span>📤 アップロード中...</span>
+                <span id="uploadPercent">0%</span>
+            </div>
+            <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="uploadBar" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- ── Processing Tasks ── -->
+        <div class="tasks-section" id="tasksSection"></div>
+
+        <!-- ── Error ── -->
+        <div class="error-message" id="errorMessage">
+            <span>⚠️</span>
+            <span id="errorText"></span>
+        </div>
+
+        <!-- ── New File Button ── -->
+        <button class="new-file-btn" id="newFileBtn" onclick="resetAll()">
+            🔄 別のファイルを文字起こし
+        </button>
+
+        <!-- ── Footer ── -->
+        <footer class="footer">
+            Powered by Whisper AI
+        </footer>
+    </div>
+
+    <script>
+        // ─── DOM ───
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileList = document.getElementById('fileList');
+        const modelSelector = document.getElementById('modelSelector');
+        const submitBtn = document.getElementById('submitBtn');
+        const uploadProgress = document.getElementById('uploadProgress');
+        const uploadPercent = document.getElementById('uploadPercent');
+        const uploadBar = document.getElementById('uploadBar');
+        const tasksSection = document.getElementById('tasksSection');
+        const errorMessage = document.getElementById('errorMessage');
+        const errorText = document.getElementById('errorText');
+        const newFileBtn = document.getElementById('newFileBtn');
+
+        let selectedFiles = [];
+        let activeTasks = [];
+        let pollInterval = null;
+
+        const VIDEO_EXTS = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.flv'];
+
+        // ─── Helpers ───
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+            return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+        }
+
+        function getFileExt(name) {
+            return '.' + name.split('.').pop().toLowerCase();
+        }
+
+        function isVideoFile(name) {
+            return VIDEO_EXTS.includes(getFileExt(name));
+        }
+
+        // ─── ページ全体のドラッグ&ドロップ防止 ───
+        document.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+
+        document.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.dataTransfer.files.length > 0) {
+                addFiles(e.dataTransfer.files);
+            }
+        });
+
+        // ─── Drop Zone Events ───
+        dropZone.addEventListener('click', () => fileInput.click());
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('drag-over');
+        });
+
+        dropZone.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('drag-over');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('drag-over');
+            addFiles(e.dataTransfer.files);
+        });
+
+        fileInput.addEventListener('change', () => {
+            addFiles(fileInput.files);
+            fileInput.value = '';
+        });
+
+        submitBtn.addEventListener('click', () => uploadFiles());
+
+        // ─── File Management ───
+        function addFiles(newFiles) {
+            for (const file of newFiles) {
+                if (!selectedFiles.some(f => f.name === file.name && f.size === file.size)) {
+                    selectedFiles.push(file);
+                }
+            }
+            renderFileList();
+            if (selectedFiles.length > 0) {
+                modelSelector.classList.add('show');
+                submitBtn.classList.add('show');
+            }
+            hideError();
+        }
+
+        function removeFile(index) {
+            selectedFiles.splice(index, 1);
+            renderFileList();
+            if (selectedFiles.length === 0) {
+                modelSelector.classList.remove('show');
+                submitBtn.classList.remove('show');
+            }
+        }
+
+        function renderFileList() {
+            if (selectedFiles.length === 0) {
+                fileList.innerHTML = '';
+                fileList.classList.remove('show');
+                return;
+            }
+            fileList.classList.add('show');
+            fileList.innerHTML = `
+        <div class="file-list-header">
+            <span>📎 ${selectedFiles.length}件のファイル</span>
+            <button class="file-clear-all" onclick="clearAllFiles()">すべて取消</button>
+        </div>
+        ${selectedFiles.map((f, i) => `
+            <div class="file-item">
+                <span class="file-item-icon">${isVideoFile(f.name) ? '🎬' : '🎵'}</span>
+                <div class="file-item-details">
+                    <div class="file-item-name">${f.name}</div>
+                    <div class="file-item-size">${formatFileSize(f.size)}</div>
+                </div>
+                <button class="file-item-remove" onclick="removeFile(${i})">✕</button>
+            </div>
+        `).join('')}
+    `;
+        }
+
+        function clearAllFiles() {
+            selectedFiles = [];
+            renderFileList();
+            modelSelector.classList.remove('show');
+            submitBtn.classList.remove('show');
+        }
+
+        // ─── Upload ───
+        function uploadFiles() {
+            if (selectedFiles.length === 0) return;
+
+            const model = document.querySelector('input[name="model"]:checked').value;
+
+            // UIを切り替え
+            submitBtn.classList.remove('show');
+            modelSelector.classList.remove('show');
+            fileList.classList.remove('show');
+            dropZone.style.display = 'none';
+            uploadProgress.classList.add('show');
+            hideError();
+
+            const formData = new FormData();
+            selectedFiles.forEach(f => formData.append('files', f));
+            formData.append('model', model);
+
+            const xhr = new XMLHttpRequest();
+
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    const pct = Math.round((e.loaded / e.total) * 100);
+                    uploadPercent.textContent = pct + '%';
+                    uploadBar.style.width = pct + '%';
+                }
+            });
+
+            xhr.addEventListener('load', () => {
+                uploadProgress.classList.remove('show');
+                try {
+                    const data = JSON.parse(xhr.responseText);
+                    if (xhr.status === 200) {
+                        activeTasks = data.tasks;
+                        showTasks();
+                        startPolling();
+                    } else {
+                        showError(data.error || 'アップロードに失敗しました');
+                        newFileBtn.classList.add('show');
+                    }
+                } catch (e) {
+                    showError('サーバーからの応答を解析できませんでした');
+                    newFileBtn.classList.add('show');
+                }
+            });
+
+            xhr.addEventListener('error', () => {
+                uploadProgress.classList.remove('show');
+                showError('サーバーに接続できません。サーバーが起動していることを確認してください。');
+                newFileBtn.classList.add('show');
+            });
+
+            xhr.open('POST', '/upload');
+            xhr.send(formData);
+        }
+
+        // ─── Polling ───
+        function startPolling() {
+            pollInterval = setInterval(async () => {
+                let allDone = true;
+
+                for (const task of activeTasks) {
+                    try {
+                        const res = await fetch(`/status/${task.task_id}`);
+                        const data = await res.json();
+                        task.data = data;
+                        updateTaskUI(task.task_id, data);
+
+                        if (data.status !== 'completed' && data.status !== 'error') {
+                            allDone = false;
+                        }
+                    } catch (e) {
+                        allDone = false;
+                    }
+                }
+
+                if (allDone) {
+                    stopPolling();
+                    newFileBtn.classList.add('show');
+                }
+            }, 1000);
+        }
+
+        function stopPolling() {
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+        }
+
+        // ─── Task UI ───
+        function showTasks() {
+            tasksSection.innerHTML = activeTasks.map(t => `
+        <div class="task-card" id="task-${t.task_id}">
+            <div class="task-header">
+                <div class="task-filename">${isVideoFile(t.filename) ? '🎬' : '🎵'} ${t.filename}</div>
+                <div class="task-status" id="status-${t.task_id}">
+                    <div class="spinner-small"></div>
+                    <span>待機中...</span>
+                </div>
+                <div class="task-progress-track" id="progress-track-${t.task_id}">
+                    <div class="task-progress-fill" id="progress-${t.task_id}"></div>
+                </div>
+            </div>
+            <div class="task-result" id="result-${t.task_id}" style="display:none"></div>
+            <div class="task-actions" id="actions-${t.task_id}" style="display:none"></div>
+        </div>
+    `).join('');
+            tasksSection.classList.add('show');
+        }
+
+        function updateTaskUI(taskId, data) {
+            const statusEl = document.getElementById(`status-${taskId}`);
+            const resultEl = document.getElementById(`result-${taskId}`);
+            const actionsEl = document.getElementById(`actions-${taskId}`);
+            const cardEl = document.getElementById(`task-${taskId}`);
+
+            if (!statusEl) return;
+
+            if (data.status === 'completed') {
+                statusEl.innerHTML = `<span class="status-done">✅ ${data.message}</span>`;
+                const progressEl = document.getElementById(`progress-${taskId}`);
+                const trackEl = document.getElementById(`progress-track-${taskId}`);
+                if (progressEl) progressEl.style.width = '100%';
+                if (trackEl) trackEl.style.display = 'none';
+                resultEl.style.display = 'block';
+                resultEl.textContent = data.result;
+                actionsEl.style.display = 'flex';
+                actionsEl.innerHTML = `
+            <button class="action-btn" onclick="copyText('${taskId}')">📋 コピー</button>
+            <button class="action-btn" onclick="downloadText('${taskId}')">💾 ダウンロード</button>
+        `;
+                cardEl.classList.add('completed');
+            } else if (data.status === 'error') {
+                statusEl.innerHTML = `<span class="status-error">❌ ${data.message}</span>`;
+                const trackEl = document.getElementById(`progress-track-${taskId}`);
+                if (trackEl) trackEl.style.display = 'none';
+                cardEl.classList.add('error');
+            } else {
+                statusEl.innerHTML = `<div class="spinner-small"></div><span>${data.message}</span>`;
+                const progressEl = document.getElementById(`progress-${taskId}`);
+                if (progressEl && data.progress) {
+                    progressEl.style.width = data.progress + '%';
+                }
+            }
+        }
+
+        // ─── Result Actions ───
+        function copyText(taskId) {
+            const task = activeTasks.find(t => t.task_id === taskId);
+            if (!task || !task.data) return;
+            navigator.clipboard.writeText(task.data.result).then(() => {
+                const btn = event.target;
+                btn.textContent = '✅ コピー済み';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = '📋 コピー';
+                    btn.classList.remove('copied');
+                }, 2000);
+            });
+        }
+
+        function downloadText(taskId) {
+            const task = activeTasks.find(t => t.task_id === taskId);
+            if (!task || !task.data) return;
+            const baseName = task.filename.replace(/\.[^.]+$/, '');
+            const blob = new Blob([task.data.result], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = baseName + '.txt';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // ─── UI State ───
+        function showError(msg) {
+            errorText.textContent = msg;
+            errorMessage.classList.add('show');
+        }
+
+        function hideError() {
+            errorMessage.classList.remove('show');
+        }
+
+        function resetAll() {
+            selectedFiles = [];
+            activeTasks = [];
+            stopPolling();
+            renderFileList();
+            hideError();
+            uploadProgress.classList.remove('show');
+            tasksSection.innerHTML = '';
+            tasksSection.classList.remove('show');
+            newFileBtn.classList.remove('show');
+            modelSelector.classList.remove('show');
+            submitBtn.classList.remove('show');
+            submitBtn.disabled = false;
+            submitBtn.textContent = '✨ 文字起こしを開始';
+            dropZone.style.display = '';
+            uploadBar.style.width = '0%';
+            uploadPercent.textContent = '0%';
+        }
+    </script>
+
+</body>
+
+</html>

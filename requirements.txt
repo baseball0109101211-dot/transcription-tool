@@ -1,0 +1,4 @@
+flask
+faster-whisper
+av
+gunicorn
