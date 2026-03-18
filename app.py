@@ -5,6 +5,9 @@ import tempfile
 import threading
 import time
 import platform
+import json
+import urllib.request
+import urllib.error
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
@@ -28,6 +31,32 @@ MLX_MODELS = {
 
 # 処理状態管理
 tasks = {}
+
+# ─── データディレクトリ ───
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+QA_FILE = os.path.join(DATA_DIR, 'qa_data.json')
+TAGS_FILE = os.path.join(DATA_DIR, 'tags.json')
+SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
+PROCESSED_FILE = os.path.join(DATA_DIR, 'processed_files.json')
+
+# AI音声用_出力 フォルダパス
+AI_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '仕事', 'AI音声用_出力')
+
+# デフォルトタグ
+DEFAULT_TAGS = [
+    {'id': 'tag_default_01', 'name': '営業'},
+    {'id': 'tag_default_02', 'name': 'マーケティング'},
+    {'id': 'tag_default_03', 'name': '動画制作'},
+    {'id': 'tag_default_04', 'name': 'デザイン'},
+    {'id': 'tag_default_05', 'name': 'ディレクション'},
+    {'id': 'tag_default_06', 'name': 'チーム管理'},
+    {'id': 'tag_default_07', 'name': 'クライアント対応'},
+    {'id': 'tag_default_08', 'name': 'ツール・技術'},
+    {'id': 'tag_default_09', 'name': '戦略・方針'},
+    {'id': 'tag_default_10', 'name': 'コンサル'},
+    {'id': 'tag_default_11', 'name': 'その他'},
+]
 
 # ─── エンジン自動判定 ───
 USE_MLX = False
@@ -317,6 +346,11 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/chat')
+def chat_page():
+    return render_template('chat.html')
+
+
 @app.route('/upload', methods=['POST'])
 def upload():
     files = request.files.getlist('files')
@@ -384,11 +418,558 @@ def status(task_id):
     })
 
 
+# ═══════════════════════════════════════════════════
+# サーバー側 Q&A ストレージ（JSONファイル）
+# ═══════════════════════════════════════════════════
+_data_lock = threading.Lock()
+
+
+def _read_json(filepath, default=None):
+    if default is None:
+        default = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def _write_json(filepath, data):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _get_tags():
+    tags = _read_json(TAGS_FILE)
+    if not tags:
+        _write_json(TAGS_FILE, DEFAULT_TAGS)
+        return DEFAULT_TAGS[:]
+    return tags
+
+
+def _get_settings():
+    return _read_json(SETTINGS_FILE, {})
+
+
+def _generate_qa_id():
+    import random
+    import string
+    ts = hex(int(time.time() * 1000))[2:]
+    rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    return f'qa_{ts}_{rand}'
+
+
+# ─── Q&A API エンドポイント ───
+@app.route('/api/qa', methods=['GET'])
+def api_get_qa():
+    with _data_lock:
+        data = _read_json(QA_FILE)
+    return jsonify(data)
+
+
+@app.route('/api/qa', methods=['POST'])
+def api_add_qa():
+    items = request.json
+    if not isinstance(items, list):
+        items = [items]
+    with _data_lock:
+        data = _read_json(QA_FILE)
+        now = time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
+        new_items = []
+        for item in items:
+            new_item = {
+                'id': _generate_qa_id(),
+                'question': item.get('question', ''),
+                'answer': item.get('answer', ''),
+                'tags': item.get('tags', []),
+                'source': item.get('source', ''),
+                'createdAt': now,
+                'updatedAt': now
+            }
+            new_items.append(new_item)
+        data = new_items + data
+        _write_json(QA_FILE, data)
+    return jsonify({'saved': len(new_items), 'total': len(data)})
+
+
+@app.route('/api/qa/<qa_id>', methods=['PUT'])
+def api_update_qa(qa_id):
+    updates = request.json
+    with _data_lock:
+        data = _read_json(QA_FILE)
+        for qa in data:
+            if qa['id'] == qa_id:
+                qa.update(updates)
+                qa['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
+                break
+        _write_json(QA_FILE, data)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/qa/<qa_id>', methods=['DELETE'])
+def api_delete_qa(qa_id):
+    with _data_lock:
+        data = [qa for qa in _read_json(QA_FILE) if qa['id'] != qa_id]
+        _write_json(QA_FILE, data)
+    return jsonify({'ok': True, 'total': len(data)})
+
+
+# ─── タグ API ───
+@app.route('/api/tags', methods=['GET'])
+def api_get_tags():
+    with _data_lock:
+        return jsonify(_get_tags())
+
+
+@app.route('/api/tags', methods=['POST'])
+def api_add_tag():
+    name = request.json.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'タグ名が必要です'}), 400
+    with _data_lock:
+        tags = _get_tags()
+        existing = next((t for t in tags if t['name'] == name), None)
+        if existing:
+            return jsonify(existing)
+        new_tag = {'id': f'tag_{uuid.uuid4().hex[:8]}', 'name': name}
+        tags.append(new_tag)
+        _write_json(TAGS_FILE, tags)
+    return jsonify(new_tag)
+
+
+@app.route('/api/tags/<tag_id>', methods=['DELETE'])
+def api_delete_tag(tag_id):
+    with _data_lock:
+        tags = [t for t in _get_tags() if t['id'] != tag_id]
+        _write_json(TAGS_FILE, tags)
+    return jsonify({'ok': True})
+
+
+# ─── 設定 API ───
+@app.route('/api/settings', methods=['GET'])
+def api_get_settings():
+    with _data_lock:
+        return jsonify(_get_settings())
+
+
+@app.route('/api/settings', methods=['POST'])
+def api_save_settings():
+    updates = request.json
+    with _data_lock:
+        settings = _get_settings()
+        settings.update(updates)
+        _write_json(SETTINGS_FILE, settings)
+    return jsonify({'ok': True})
+
+
+# ─── データ エクスポート/インポート API ───
+@app.route('/api/export', methods=['GET'])
+def api_export():
+    with _data_lock:
+        data = {
+            'version': 1,
+            'exportedAt': time.strftime('%Y-%m-%dT%H:%M:%S+09:00'),
+            'qaData': _read_json(QA_FILE),
+            'tags': _get_tags()
+        }
+    return jsonify(data)
+
+
+@app.route('/api/import', methods=['POST'])
+def api_import():
+    imported = request.json
+    if not imported or 'qaData' not in imported:
+        return jsonify({'error': 'Invalid format'}), 400
+    with _data_lock:
+        existing = _read_json(QA_FILE)
+        existing_ids = {qa['id'] for qa in existing}
+        new_items = [qa for qa in imported['qaData'] if qa['id'] not in existing_ids]
+        merged = new_items + existing
+        _write_json(QA_FILE, merged)
+        if 'tags' in imported:
+            tags = _get_tags()
+            tag_ids = {t['id'] for t in tags}
+            for tag in imported['tags']:
+                if tag['id'] not in tag_ids:
+                    tags.append(tag)
+            _write_json(TAGS_FILE, tags)
+    return jsonify({'imported': len(new_items), 'total': len(merged)})
+
+
+@app.route('/api/clear', methods=['POST'])
+def api_clear():
+    with _data_lock:
+        _write_json(QA_FILE, [])
+        _write_json(TAGS_FILE, DEFAULT_TAGS)
+    return jsonify({'ok': True})
+
+
+# ═══════════════════════════════════════════════════
+# 壁打ちAI チャット API
+# ═══════════════════════════════════════════════════
+def _search_relevant_qa(query, max_results=10):
+    """Q&Aデータからクエリに関連するエントリを検索"""
+    qa_data = _read_json(QA_FILE)
+    if not qa_data:
+        return []
+
+    query_lower = query.lower()
+    keywords = [w for w in query_lower.split() if len(w) > 1]
+
+    scored = []
+    for qa in qa_data:
+        score = 0
+        q_lower = qa.get('question', '').lower()
+        a_lower = qa.get('answer', '').lower()
+        combined = q_lower + ' ' + a_lower
+
+        # キーワードマッチ
+        for kw in keywords:
+            if kw in q_lower:
+                score += 3
+            if kw in a_lower:
+                score += 2
+
+        # 完全クエリマッチ
+        if query_lower in combined:
+            score += 5
+
+        if score > 0:
+            scored.append((score, qa))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:max_results]]
+
+
+@app.route('/api/chat', methods=['POST', 'OPTIONS'])
+def api_chat():
+    # CORS対応（別ドメインの壁打ちAIから呼ばれる）
+    if request.method == 'OPTIONS':
+        resp = jsonify({})
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        resp.headers['Access-Control-Allow-Methods'] = 'POST'
+        return resp
+
+    data = request.json
+    user_message = data.get('message', '')
+    history = data.get('history', [])
+
+    if not user_message:
+        return jsonify({'error': 'メッセージが必要です'}), 400
+
+    settings = _get_settings()
+    api_key = settings.get('gemini_api_key')
+    if not api_key:
+        resp = jsonify({'error': 'Gemini APIキーが設定されていません。統合ツールの設定画面でAPIキーを入力してください。'})
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp, 400
+
+    # 関連Q&Aを検索
+    relevant_qa = _search_relevant_qa(user_message)
+    tags = _get_tags()
+    tag_map = {t['id']: t['name'] for t in tags}
+
+    # コンテキスト構築
+    context_parts = []
+    references = []
+    for qa in relevant_qa:
+        tag_names = [tag_map.get(tid, '') for tid in qa.get('tags', []) if tag_map.get(tid)]
+        tags_str = f" [{', '.join(tag_names)}]" if tag_names else ''
+        context_parts.append(f"Q: {qa['question']}\nA: {qa['answer']}{tags_str}")
+        references.append({
+            'question': qa['question'],
+            'answer': qa['answer'][:200] + ('...' if len(qa.get('answer', '')) > 200 else ''),
+            'tags': [tag_map.get(tid, '') for tid in qa.get('tags', []) if tag_map.get(tid)]
+        })
+
+    context_text = '\n\n---\n\n'.join(context_parts) if context_parts else '（関連するナレッジが見つかりませんでした）'
+
+    system_prompt = f"""あなたは「壁打ちAI」です。ユーザーの仕事やビジネスについて、蓄積されたナレッジベースの知識を使って回答・アドバイスする親しみやすいAIアシスタントです。
+
+## あなたの役割:
+- ユーザーのビジネスに関する質問に、ナレッジベースの情報を活用して具体的に回答する
+- 壁打ち相手として、アイデアの深掘りや新しい視点を提供する
+- 実践的で具体的なアドバイスを心がける
+- フランクで親しみやすい口調で話す
+
+## ナレッジベースから取得した関連情報:
+{context_text}
+
+## ルール:
+1. ナレッジベースの情報がある場合は、それを活用して回答してください
+2. ナレッジベースにない情報は、一般的な知識で補完してOKです
+3. 回答は簡潔で実用的にまとめてください
+4. 必要に応じて箇条書きや見出しを使ってください"""
+
+    # Gemini API呼出し
+    contents = []
+    for msg in history[-10:]:  # 直近10件の会話履歴
+        role = 'user' if msg.get('role') == 'user' else 'model'
+        contents.append({'role': role, 'parts': [{'text': msg.get('content', '')}]})
+    contents.append({'role': 'user', 'parts': [{'text': user_message}]})
+
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}'
+    payload = json.dumps({
+        'systemInstruction': {'parts': [{'text': system_prompt}]},
+        'contents': contents,
+        'generationConfig': {
+            'temperature': 0.7,
+            'maxOutputTokens': 4096
+        }
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp_api:
+            result = json.loads(resp_api.read().decode('utf-8'))
+    except Exception as e:
+        resp = jsonify({'error': f'Gemini API エラー: {str(e)}'})
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp, 500
+
+    ai_response = ''
+    try:
+        ai_response = result['candidates'][0]['content']['parts'][0]['text']
+    except (KeyError, IndexError):
+        ai_response = 'すみません、回答を生成できませんでした。もう一度試してください。'
+
+    resp = jsonify({
+        'response': ai_response,
+        'references': references,
+        'qa_count': len(relevant_qa)
+    })
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
+
+
+# ═══════════════════════════════════════════════════
+# Gemini API でQ&A抽出（サーバーサイド）
+# ═══════════════════════════════════════════════════
+def _gemini_extract_qa(text, source=''):
+    """Gemini API を呼んでテキストからQ&Aペアを抽出"""
+    settings = _get_settings()
+    api_key = settings.get('gemini_api_key')
+    if not api_key:
+        print('⚠️ Gemini APIキーが未設定のためQ&A抽出をスキップ')
+        return []
+
+    tags = _get_tags()
+    tag_names = [t['name'] for t in tags]
+
+    prompt = f"""あなたはプロのナレッジマネジメントの専門家です。以下のテキストから、有用なQ&A（質問と回答）のペアを抽出してください。
+
+ルール:
+1. 知識として再利用できる質問と回答のペアを複数抽出してください
+2. 質問は具体的な疑問形にしてください
+3. 回答はそのまま使えるレベルで具体的にまとめてください
+4. 各Q&Aに、利用可能なタグから最も適切なものを1〜3つ付けてください
+5. テキストの内容に合うタグがない場合は、新しいタグ名を提案してください
+
+利用可能なタグ: {', '.join(tag_names)}
+
+入力テキスト:
+\"\"\"
+{text[:15000]}
+\"\"\"
+
+出力形式（必ずこのJSON形式で返してください）:
+```json
+{{
+  "qa_pairs": [
+    {{
+      "question": "質問テキスト",
+      "answer": "回答テキスト",
+      "tags": ["タグ1", "タグ2"]
+    }}
+  ]
+}}
+```
+
+最低3つ、内容が豊富なら10個以上抽出してください。"""
+
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}'
+    payload = json.dumps({
+        'contents': [{'parts': [{'text': prompt}]}],
+        'generationConfig': {
+            'temperature': 0.3,
+            'maxOutputTokens': 8192,
+            'responseMimeType': 'application/json'
+        }
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        print(f'❌ Gemini API エラー: {e}')
+        return []
+
+    content = None
+    try:
+        content = result['candidates'][0]['content']['parts'][0]['text']
+    except (KeyError, IndexError):
+        print('❌ Gemini APIの応答が空です')
+        return []
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        import re
+        m = re.search(r'```(?:json)?\s*([\s\S]*?)```', content)
+        if m:
+            try:
+                parsed = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                print('❌ JSONパースエラー')
+                return []
+        else:
+            print('❌ JSONパースエラー')
+            return []
+
+    if 'qa_pairs' not in parsed:
+        return []
+
+    # タグ名→IDの変換
+    tag_name_to_id = {t['name']: t['id'] for t in _get_tags()}
+    qa_items = []
+    for pair in parsed['qa_pairs']:
+        tag_ids = []
+        for tag_name in pair.get('tags', []):
+            clean = tag_name.replace('[新規]', '').strip()
+            if clean in tag_name_to_id:
+                tag_ids.append(tag_name_to_id[clean])
+            else:
+                new_tag = {'id': f'tag_{uuid.uuid4().hex[:8]}', 'name': clean}
+                with _data_lock:
+                    tags_list = _get_tags()
+                    tags_list.append(new_tag)
+                    _write_json(TAGS_FILE, tags_list)
+                tag_name_to_id[clean] = new_tag['id']
+                tag_ids.append(new_tag['id'])
+
+        qa_items.append({
+            'question': pair.get('question', ''),
+            'answer': pair.get('answer', ''),
+            'tags': tag_ids,
+            'source': source
+        })
+
+    return qa_items
+
+
+# ═══════════════════════════════════════════════════
+# AI音声用_出力 フォルダ監視
+# ═══════════════════════════════════════════════════
+def _get_processed_files():
+    return set(_read_json(PROCESSED_FILE, []))
+
+
+def _add_processed_file(filepath):
+    with _data_lock:
+        processed = _get_processed_files()
+        processed.add(filepath)
+        _write_json(PROCESSED_FILE, list(processed))
+
+
+def _watch_ai_output():
+    """AI音声用_出力フォルダを定期的にチェックし、新しいテキストをQ&Aに変換"""
+    resolved = os.path.realpath(AI_OUTPUT_DIR)
+    if not os.path.isdir(resolved):
+        print(f'⚠️ AI音声用_出力フォルダが見つかりません: {resolved}')
+        print('  → フォルダ監視は無効です')
+        return
+
+    print(f'👁️ AI音声用_出力フォルダを監視中: {resolved}')
+
+    while True:
+        try:
+            processed = _get_processed_files()
+            settings = _get_settings()
+            api_key = settings.get('gemini_api_key')
+
+            if not api_key:
+                time.sleep(60)
+                continue
+
+            # 全サブフォルダの .txt ファイルをスキャン
+            for category in os.listdir(resolved):
+                cat_path = os.path.join(resolved, category)
+                if not os.path.isdir(cat_path):
+                    continue
+
+                for filename in os.listdir(cat_path):
+                    if not filename.endswith('.txt'):
+                        continue
+                    if filename.endswith('_analysis.txt'):
+                        continue  # 分析結果はスキップ
+
+                    filepath = os.path.join(cat_path, filename)
+                    if filepath in processed:
+                        continue
+
+                    # 新しいファイル発見
+                    print(f'📄 新しいテキスト検出: {category}/{filename}')
+
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            text = f.read().strip()
+                    except Exception as e:
+                        print(f'  ❌ ファイル読み込みエラー: {e}')
+                        _add_processed_file(filepath)
+                        continue
+
+                    if len(text) < 50:
+                        print(f'  ⏭️ テキストが短すぎるためスキップ ({len(text)}文字)')
+                        _add_processed_file(filepath)
+                        continue
+
+                    source = f'🎤 {category}/{filename.replace(".txt", "")}'
+                    print(f'  🤖 Q&A抽出中...')
+                    qa_items = _gemini_extract_qa(text, source)
+
+                    if qa_items:
+                        now = time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
+                        new_items = [{
+                            'id': _generate_qa_id(),
+                            'question': item['question'],
+                            'answer': item['answer'],
+                            'tags': item['tags'],
+                            'source': item['source'],
+                            'createdAt': now,
+                            'updatedAt': now
+                        } for item in qa_items]
+
+                        with _data_lock:
+                            data = _read_json(QA_FILE)
+                            data = new_items + data
+                            _write_json(QA_FILE, data)
+
+                        print(f'  ✅ {len(new_items)}件のQ&Aを保存しました')
+                    else:
+                        print(f'  ⚠️ Q&Aを抽出できませんでした')
+
+                    _add_processed_file(filepath)
+
+                    # API レートリミット対策
+                    time.sleep(5)
+
+        except Exception as e:
+            print(f'❌ フォルダ監視エラー: {e}')
+
+        time.sleep(30)  # 30秒ごとにチェック
+
+
+# ─── gunicorn対応：アプリ起動時にフォルダ監視を開始 ───
+watcher_thread = threading.Thread(target=_watch_ai_output, daemon=True)
+watcher_thread.start()
+
 if __name__ == '__main__':
     engine_name = "MLX-Whisper (Apple GPU)" if USE_MLX else "faster-whisper (CPU)"
 
     print("\n╔══════════════════════════════════════════════════╗")
-    print("║   🎙️  文字起こしツール 起動中...               ║")
+    print("║   🎙️  文字起こし & ナレッジベース 起動中...     ║")
     print(f"║   ⚡ {engine_name:38s}   ║")
     print("╚══════════════════════════════════════════════════╝\n")
 
