@@ -8,6 +8,7 @@ import platform
 import json
 import urllib.request
 import urllib.error
+import mimetypes
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
@@ -298,9 +299,126 @@ def transcribe_faster(audio_path, model_size, task_id):
     return '\n'.join(texts) if texts else '（音声が検出されませんでした）'
 
 
+# ─── Groq API 文字起こし ───
+def transcribe_groq(audio_path, task_id):
+    """Groq APIで超高速文字起こし（whisper-large-v3-turbo）"""
+    settings = _get_settings()
+    api_key = settings.get('groq_api_key')
+    if not api_key:
+        raise RuntimeError('Groq APIキーが未設定です')
+
+    tasks[task_id]['message'] = '🚀 Groq API で文字起こし中...'
+    tasks[task_id]['progress'] = 10
+
+    # 動画の場合はまず音声を抽出
+    ext = os.path.splitext(audio_path)[1].lower()
+    input_path = audio_path
+    wav_path = None
+
+    if ext in ALLOWED_VIDEO:
+        tasks[task_id]['message'] = '動画から音声を抽出中...'
+        wav_path = audio_path + '_audio.wav'
+        extract_audio_pyav(audio_path, wav_path)
+        input_path = wav_path
+        tasks[task_id]['message'] = '🚀 Groq API で文字起こし中...'
+
+    tasks[task_id]['progress'] = 20
+
+    # ファイルサイズチェック（Groq上限25MB）
+    file_size = os.path.getsize(input_path)
+    if file_size > 25 * 1024 * 1024:
+        raise RuntimeError(f'ファイルサイズが25MBを超えています（{file_size/(1024*1024):.1f}MB）。短いファイルに分割してください。')
+
+    # multipart/form-dataでファイルをアップロード
+    boundary = f'----FormBoundary{uuid.uuid4().hex}'
+    content_type, _ = mimetypes.guess_type(input_path)
+    if not content_type:
+        content_type = 'audio/wav' if input_path.endswith('.wav') else 'application/octet-stream'
+
+    filename = os.path.basename(input_path)
+
+    # bodyを構築
+    body_parts = []
+
+    # model field
+    body_parts.append(f'--{boundary}'.encode())
+    body_parts.append(b'Content-Disposition: form-data; name="model"')
+    body_parts.append(b'')
+    body_parts.append(b'whisper-large-v3-turbo')
+
+    # language field
+    body_parts.append(f'--{boundary}'.encode())
+    body_parts.append(b'Content-Disposition: form-data; name="language"')
+    body_parts.append(b'')
+    body_parts.append(b'ja')
+
+    # response_format field
+    body_parts.append(f'--{boundary}'.encode())
+    body_parts.append(b'Content-Disposition: form-data; name="response_format"')
+    body_parts.append(b'')
+    body_parts.append(b'verbose_json')
+
+    # file field
+    body_parts.append(f'--{boundary}'.encode())
+    body_parts.append(f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode())
+    body_parts.append(f'Content-Type: {content_type}'.encode())
+    body_parts.append(b'')
+    with open(input_path, 'rb') as f:
+        body_parts.append(f.read())
+
+    body_parts.append(f'--{boundary}--'.encode())
+    body_parts.append(b'')
+
+    body = b'\r\n'.join(body_parts)
+
+    tasks[task_id]['progress'] = 40
+    tasks[task_id]['message'] = '🚀 Groq API にアップロード中...'
+
+    req = urllib.request.Request(
+        'https://api.groq.com/openai/v1/audio/transcriptions',
+        data=body,
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8', errors='replace')
+        raise RuntimeError(f'Groq API エラー ({e.code}): {error_body}')
+    except Exception as e:
+        raise RuntimeError(f'Groq API 接続エラー: {str(e)}')
+
+    tasks[task_id]['progress'] = 90
+
+    # レスポンス解析
+    text = result.get('text', '').strip()
+
+    # 一時WAVファイルの削除
+    if wav_path and os.path.exists(wav_path):
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+
+    return text if text else '（音声が検出されませんでした）'
+
+
 # ─── 統合文字起こし関数 ───
 def transcribe_file(audio_path, model_size, task_id):
     """環境に応じて最適なエンジンで文字起こし"""
+    # Groq APIキーが設定されていれば最優先
+    settings = _get_settings()
+    if settings.get('groq_api_key'):
+        try:
+            return transcribe_groq(audio_path, task_id)
+        except Exception as e:
+            print(f'⚠️ Groq APIエラー、ローカルエンジンにフォールバック: {e}')
+            tasks[task_id]['message'] = 'ローカルエンジンにフォールバック中...'
+
     if USE_MLX:
         return transcribe_mlx(audio_path, model_size, task_id)
     else:
@@ -314,7 +432,13 @@ def process_file(task_id, file_path, original_filename, model_size):
         tasks[task_id]['progress'] = 0
         start_time = time.time()
 
-        engine = "MLX-Whisper (GPU)" if USE_MLX else "faster-whisper (CPU)"
+        settings = _get_settings()
+        if settings.get('groq_api_key'):
+            engine = "Groq API (whisper-large-v3-turbo)"
+        elif USE_MLX:
+            engine = "MLX-Whisper (GPU)"
+        else:
+            engine = "faster-whisper (CPU)"
         tasks[task_id]['message'] = f'音声を読み込み中... [{engine}]'
 
         text = transcribe_file(file_path, model_size, task_id)

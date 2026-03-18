@@ -183,7 +183,21 @@
                 <div class="settings-title">⚙️ 設定</div>
 
                 <div class="settings-card">
-                    <div class="settings-card-title">🔑 Gemini API キー</div>
+                    <div class="settings-card-title">🚀 Groq API キー（文字起こし用）</div>
+                    <div class="settings-card-desc">
+                        Groq API を使うと超高速（300倍速）で高精度な文字起こしが可能です。
+                        <a href="https://console.groq.com/keys" target="_blank" style="color: var(--accent-light)">Groq
+                            Console</a> で無料で取得できます。
+                    </div>
+                    <div class="settings-input-row">
+                        <input class="settings-input" id="groqKeyInput" type="password" placeholder="gsk_...">
+                        <button class="settings-save-btn" onclick="saveGroqKey()">保存</button>
+                    </div>
+                    <div class="settings-status" id="groqKeyStatus"></div>
+                </div>
+
+                <div class="settings-card">
+                    <div class="settings-card-title">🔑 Gemini API キー（Q&A抽出用）</div>
                     <div class="settings-card-desc">
                         Q&Aの自動抽出に Gemini API を使用します。
                         <a href="https://aistudio.google.com/app/apikey" target="_blank"
@@ -214,7 +228,7 @@
 
         <!-- ── Footer ── -->
         <footer class="footer">
-            Powered by Whisper AI & Gemini
+            Powered by Groq Whisper & Gemini
         </footer>
     </div>
 
@@ -1021,6 +1035,13 @@ ${text}
                 document.getElementById('apiKeyStatus').innerHTML =
                     '<span class="settings-status connected">✅ APIキー設定済み</span>';
             }
+            const groqKey = Storage.getSetting('groq_api_key');
+            const groqInput = document.getElementById('groqKeyInput');
+            if (groqKey) {
+                groqInput.value = groqKey;
+                document.getElementById('groqKeyStatus').innerHTML =
+                    '<span class="settings-status connected">✅ Groqキー設定済み（超高速モード）</span>';
+            }
         }
 
         async function saveApiKey() {
@@ -1037,6 +1058,15 @@ ${text}
                 statusEl.innerHTML = '<span class="settings-status error">❌ 接続に失敗しました。APIキーを確認してください</span>';
                 showToast('❌ APIキーの確認に失敗しました', 'error');
             }
+        }
+
+        async function saveGroqKey() {
+            const key = document.getElementById('groqKeyInput').value.trim();
+            if (!key) { showToast('⚠️ Groqキーを入力してください', 'error'); return; }
+            await Storage.saveSetting('groq_api_key', key);
+            const statusEl = document.getElementById('groqKeyStatus');
+            statusEl.innerHTML = '<span class="settings-status connected">✅ Groqキー保存済み（超高速モードが有効になります）</span>';
+            showToast('✅ Groq APIキーを保存しました', 'success');
         }
 
         async function exportData() {
