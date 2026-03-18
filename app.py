@@ -313,14 +313,34 @@ def transcribe_groq(audio_path, task_id):
     # 動画の場合はまず音声を抽出
     ext = os.path.splitext(audio_path)[1].lower()
     input_path = audio_path
-    wav_path = None
+    temp_files = []  # 後で削除するファイル
 
     if ext in ALLOWED_VIDEO:
         tasks[task_id]['message'] = '動画から音声を抽出中...'
         wav_path = audio_path + '_audio.wav'
         extract_audio_pyav(audio_path, wav_path)
         input_path = wav_path
+        temp_files.append(wav_path)
         tasks[task_id]['message'] = '🚀 Groq API で文字起こし中...'
+
+    # WAVファイルをMP3に圧縮（アップロード高速化）
+    if input_path.lower().endswith('.wav'):
+        tasks[task_id]['message'] = '🔄 音声を圧縮中...'
+        mp3_path = input_path.rsplit('.', 1)[0] + '.mp3'
+        try:
+            import subprocess
+            subprocess.run(
+                ['ffmpeg', '-i', input_path, '-codec:a', 'libmp3lame', '-qscale:a', '4', '-y', mp3_path],
+                capture_output=True, timeout=30
+            )
+            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                old_size = os.path.getsize(input_path)
+                new_size = os.path.getsize(mp3_path)
+                print(f'  📦 圧縮: {old_size/(1024*1024):.1f}MB → {new_size/(1024*1024):.1f}MB ({new_size/old_size*100:.0f}%)')
+                input_path = mp3_path
+                temp_files.append(mp3_path)
+        except Exception as e:
+            print(f'  ⚠️ 圧縮スキップ: {e}')
 
     tasks[task_id]['progress'] = 20
 
@@ -397,10 +417,11 @@ def transcribe_groq(audio_path, task_id):
     # レスポンス解析
     text = result.get('text', '').strip()
 
-    # 一時WAVファイルの削除
-    if wav_path and os.path.exists(wav_path):
+    # 一時ファイルの削除
+    for tmp in temp_files:
         try:
-            os.remove(wav_path)
+            if os.path.exists(tmp):
+                os.remove(tmp)
         except OSError:
             pass
 
@@ -430,16 +451,8 @@ def process_file(task_id, file_path, original_filename, model_size):
     try:
         tasks[task_id]['status'] = 'processing'
         tasks[task_id]['progress'] = 0
+        tasks[task_id]['message'] = '準備中...'
         start_time = time.time()
-
-        settings = _get_settings()
-        if settings.get('groq_api_key'):
-            engine = "Groq API (whisper-large-v3-turbo)"
-        elif USE_MLX:
-            engine = "MLX-Whisper (GPU)"
-        else:
-            engine = "faster-whisper (CPU)"
-        tasks[task_id]['message'] = f'音声を読み込み中... [{engine}]'
 
         text = transcribe_file(file_path, model_size, task_id)
 
