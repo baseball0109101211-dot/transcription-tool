@@ -665,53 +665,164 @@ ${text}
             submitBtn.classList.remove('show');
         }
 
+        // ─── Client-side Groq API transcription ───
+        async function transcribeWithGroq(file) {
+            const groqKey = Storage.getSetting('groq_api_key');
+            if (!groqKey) return null;
+            if (file.size > 25 * 1024 * 1024) return null; // 25MB超はサーバーフォールバック
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('model', 'whisper-large-v3-turbo');
+            formData.append('language', 'ja');
+            formData.append('response_format', 'verbose_json');
+
+            const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${groqKey}` },
+                body: formData
+            });
+            if (!resp.ok) {
+                const errText = await resp.text();
+                throw new Error(`Groq API (${resp.status}): ${errText}`);
+            }
+            const result = await resp.json();
+            return result.text || '';
+        }
+
         function uploadFiles() {
             if (selectedFiles.length === 0) return;
-            const model = document.querySelector('input[name="model"]:checked').value;
 
             submitBtn.classList.remove('show');
             modelSelector.classList.remove('show');
             fileList.classList.remove('show');
             dropZone.style.display = 'none';
-            uploadProgress.classList.add('show');
+            uploadProgress.classList.remove('show');
             hideError();
 
-            const formData = new FormData();
-            selectedFiles.forEach(f => formData.append('files', f));
-            formData.append('model', model);
+            const groqKey = Storage.getSetting('groq_api_key');
 
-            const xhr = new XMLHttpRequest();
-            xhr.upload.addEventListener('progress', (e) => {
-                if (e.lengthComputable) {
-                    const pct = Math.round((e.loaded / e.total) * 100);
-                    uploadPercent.textContent = pct + '%';
-                    uploadBar.style.width = pct + '%';
-                }
-            });
-            xhr.addEventListener('load', () => {
-                uploadProgress.classList.remove('show');
-                try {
-                    const data = JSON.parse(xhr.responseText);
-                    if (xhr.status === 200) {
-                        activeTasks = data.tasks;
-                        showTasks();
-                        startPolling();
-                    } else {
-                        showError(data.error || 'アップロードに失敗しました');
+            if (groqKey) {
+                // ── クライアントサイド Groq API ──
+                activeTasks = selectedFiles.map((f, i) => ({
+                    task_id: 'local_' + Date.now() + '_' + i,
+                    filename: f.name,
+                    data: { status: 'processing', message: '🚀 Groq API で文字起こし中...', progress: 10, result: null }
+                }));
+                showTasks();
+
+                (async () => {
+                    for (let i = 0; i < selectedFiles.length; i++) {
+                        const file = selectedFiles[i];
+                        const task = activeTasks[i];
+                        const statusEl = document.getElementById(`status-${task.task_id}`);
+                        const progressEl = document.getElementById(`progress-${task.task_id}`);
+
+                        try {
+                            if (statusEl) statusEl.innerHTML = `<div class="spinner-small"></div><span>🚀 Groq API で文字起こし中... (${i + 1}/${selectedFiles.length})</span>`;
+                            if (progressEl) progressEl.style.width = '30%';
+
+                            const text = await transcribeWithGroq(file);
+
+                            if (text === null) {
+                                // Groq APIが使えない場合、サーバーフォールバック
+                                if (statusEl) statusEl.innerHTML = `<div class="spinner-small"></div><span>サーバーで処理中...</span>`;
+                                // Server upload fallback
+                                const formData = new FormData();
+                                formData.append('files', file);
+                                formData.append('model', 'base');
+                                const resp = await fetch('/upload', { method: 'POST', body: formData });
+                                const data = await resp.json();
+                                if (data.tasks && data.tasks[0]) {
+                                    task.task_id_server = data.tasks[0].task_id;
+                                    // Poll server
+                                    await new Promise((resolve) => {
+                                        const poll = setInterval(async () => {
+                                            const sr = await fetch(`/status/${task.task_id_server}`);
+                                            const sd = await sr.json();
+                                            if (statusEl) statusEl.innerHTML = `<div class="spinner-small"></div><span>${sd.message || '処理中...'}</span>`;
+                                            if (sd.status === 'completed') {
+                                                clearInterval(poll);
+                                                task.data = sd;
+                                                updateTaskUI(task.task_id, sd);
+                                                resolve();
+                                            } else if (sd.status === 'error') {
+                                                clearInterval(poll);
+                                                task.data = sd;
+                                                updateTaskUI(task.task_id, sd);
+                                                resolve();
+                                            }
+                                        }, 2000);
+                                    });
+                                }
+                                continue;
+                            }
+
+                            task.data = {
+                                status: 'completed',
+                                message: '完了！',
+                                result: text || '（音声が検出されませんでした）',
+                                filename: file.name,
+                                progress: 100
+                            };
+                            updateTaskUI(task.task_id, task.data);
+
+                        } catch (err) {
+                            console.error('Groq error:', err);
+                            task.data = {
+                                status: 'error',
+                                message: `エラー: ${err.message}`,
+                                result: null,
+                                filename: file.name,
+                                progress: 0
+                            };
+                            updateTaskUI(task.task_id, task.data);
+                        }
+                    }
+                    newFileBtn.classList.add('show');
+                })();
+            } else {
+                // ── サーバーサイド処理（Groqキーなし） ──
+                const model = document.querySelector('input[name="model"]:checked').value;
+                uploadProgress.classList.add('show');
+
+                const formData = new FormData();
+                selectedFiles.forEach(f => formData.append('files', f));
+                formData.append('model', model);
+
+                const xhr = new XMLHttpRequest();
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        const pct = Math.round((e.loaded / e.total) * 100);
+                        uploadPercent.textContent = pct + '%';
+                        uploadBar.style.width = pct + '%';
+                    }
+                });
+                xhr.addEventListener('load', () => {
+                    uploadProgress.classList.remove('show');
+                    try {
+                        const data = JSON.parse(xhr.responseText);
+                        if (xhr.status === 200) {
+                            activeTasks = data.tasks;
+                            showTasks();
+                            startPolling();
+                        } else {
+                            showError(data.error || 'アップロードに失敗しました');
+                            newFileBtn.classList.add('show');
+                        }
+                    } catch (e) {
+                        showError('サーバーからの応答を解析できませんでした');
                         newFileBtn.classList.add('show');
                     }
-                } catch (e) {
-                    showError('サーバーからの応答を解析できませんでした');
+                });
+                xhr.addEventListener('error', () => {
+                    uploadProgress.classList.remove('show');
+                    showError('サーバーに接続できません。サーバーが起動していることを確認してください。');
                     newFileBtn.classList.add('show');
-                }
-            });
-            xhr.addEventListener('error', () => {
-                uploadProgress.classList.remove('show');
-                showError('サーバーに接続できません。サーバーが起動していることを確認してください。');
-                newFileBtn.classList.add('show');
-            });
-            xhr.open('POST', '/upload');
-            xhr.send(formData);
+                });
+                xhr.open('POST', '/upload');
+                xhr.send(formData);
+            }
         }
 
         // ─── Polling ───
