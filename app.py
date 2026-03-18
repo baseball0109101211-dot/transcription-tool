@@ -33,13 +33,13 @@ MLX_MODELS = {
 # 処理状態管理
 tasks = {}
 
-# ─── データディレクトリ ───
+# ─── Firebase Realtime Database ───
+FIREBASE_URL = "https://reworks-curriculum-default-rtdb.asia-southeast1.firebasedatabase.app"
+FIREBASE_PATH = "transcription-tool"
+
+# ローカルフォールバック用（Firebase接続失敗時）
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 os.makedirs(DATA_DIR, exist_ok=True)
-QA_FILE = os.path.join(DATA_DIR, 'qa_data.json')
-TAGS_FILE = os.path.join(DATA_DIR, 'tags.json')
-SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
-PROCESSED_FILE = os.path.join(DATA_DIR, 'processed_files.json')
 
 # AI音声用_出力 フォルダパス
 AI_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '仕事', 'AI音声用_出力')
@@ -543,36 +543,90 @@ def status(task_id):
 
 
 # ═══════════════════════════════════════════════════
-# サーバー側 Q&A ストレージ（JSONファイル）
+# Firebase REST API ストレージ
 # ═══════════════════════════════════════════════════
 _data_lock = threading.Lock()
 
 
-def _read_json(filepath, default=None):
-    if default is None:
-        default = []
+def _firebase_get(path, default=None):
+    """Firebase Realtime Database からデータ取得"""
+    url = f'{FIREBASE_URL}/{FIREBASE_PATH}/{path}.json'
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            return data if data is not None else (default if default is not None else None)
+    except Exception as e:
+        print(f'⚠️ Firebase GET エラー ({path}): {e}')
+        return default if default is not None else None
 
 
-def _write_json(filepath, data):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def _firebase_put(path, data):
+    """Firebase Realtime Database にデータ書込み（上書き）"""
+    url = f'{FIREBASE_URL}/{FIREBASE_PATH}/{path}.json'
+    try:
+        payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, method='PUT',
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True
+    except Exception as e:
+        print(f'⚠️ Firebase PUT エラー ({path}): {e}')
+        return False
+
+
+def _firebase_patch(path, data):
+    """Firebase Realtime Database に部分更新"""
+    url = f'{FIREBASE_URL}/{FIREBASE_PATH}/{path}.json'
+    try:
+        payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, method='PATCH',
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True
+    except Exception as e:
+        print(f'⚠️ Firebase PATCH エラー ({path}): {e}')
+        return False
+
+
+def _firebase_delete(path):
+    """Firebase Realtime Database からデータ削除"""
+    url = f'{FIREBASE_URL}/{FIREBASE_PATH}/{path}.json'
+    try:
+        req = urllib.request.Request(url, method='DELETE')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True
+    except Exception as e:
+        print(f'⚠️ Firebase DELETE エラー ({path}): {e}')
+        return False
+
+
+def _get_qa_list():
+    """Q&Aデータをリストとして取得（Firebase上はオブジェクト構造）"""
+    data = _firebase_get('qa', {})
+    if not data or not isinstance(data, dict):
+        return []
+    # オブジェクト→リストに変換、createdAt降順でソート
+    qa_list = list(data.values())
+    qa_list.sort(key=lambda x: x.get('createdAt', ''), reverse=True)
+    return qa_list
 
 
 def _get_tags():
-    tags = _read_json(TAGS_FILE)
+    tags = _firebase_get('tags')
     if not tags:
-        _write_json(TAGS_FILE, DEFAULT_TAGS)
+        # デフォルトタグを書き込み
+        tags_dict = {t['id']: t for t in DEFAULT_TAGS}
+        _firebase_put('tags', tags_dict)
         return DEFAULT_TAGS[:]
-    return tags
+    if isinstance(tags, dict):
+        return list(tags.values())
+    return tags if isinstance(tags, list) else DEFAULT_TAGS[:]
 
 
 def _get_settings():
-    return _read_json(SETTINGS_FILE, {})
+    settings = _firebase_get('settings', {})
+    return settings if isinstance(settings, dict) else {}
 
 
 def _generate_qa_id():
@@ -587,7 +641,7 @@ def _generate_qa_id():
 @app.route('/api/qa', methods=['GET'])
 def api_get_qa():
     with _data_lock:
-        data = _read_json(QA_FILE)
+        data = _get_qa_list()
     return jsonify(data)
 
 
@@ -596,46 +650,41 @@ def api_add_qa():
     items = request.json
     if not isinstance(items, list):
         items = [items]
+    now = time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
+    new_items = []
+    for item in items:
+        qa_id = item.get('id') or _generate_qa_id()
+        new_item = {
+            'id': qa_id,
+            'question': item.get('question', ''),
+            'answer': item.get('answer', ''),
+            'tags': item.get('tags', []),
+            'source': item.get('source', ''),
+            'createdAt': item.get('createdAt', now),
+            'updatedAt': item.get('updatedAt', now)
+        }
+        new_items.append(new_item)
+    # Firebase にバッチ書込み
     with _data_lock:
-        data = _read_json(QA_FILE)
-        now = time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
-        new_items = []
-        for item in items:
-            new_item = {
-                'id': _generate_qa_id(),
-                'question': item.get('question', ''),
-                'answer': item.get('answer', ''),
-                'tags': item.get('tags', []),
-                'source': item.get('source', ''),
-                'createdAt': now,
-                'updatedAt': now
-            }
-            new_items.append(new_item)
-        data = new_items + data
-        _write_json(QA_FILE, data)
-    return jsonify({'saved': len(new_items), 'total': len(data)})
+        batch = {item['id']: item for item in new_items}
+        _firebase_patch('qa', batch)
+    return jsonify({'saved': len(new_items), 'total': len(new_items)})
 
 
 @app.route('/api/qa/<qa_id>', methods=['PUT'])
 def api_update_qa(qa_id):
     updates = request.json
+    updates['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
     with _data_lock:
-        data = _read_json(QA_FILE)
-        for qa in data:
-            if qa['id'] == qa_id:
-                qa.update(updates)
-                qa['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
-                break
-        _write_json(QA_FILE, data)
+        _firebase_patch(f'qa/{qa_id}', updates)
     return jsonify({'ok': True})
 
 
 @app.route('/api/qa/<qa_id>', methods=['DELETE'])
 def api_delete_qa(qa_id):
     with _data_lock:
-        data = [qa for qa in _read_json(QA_FILE) if qa['id'] != qa_id]
-        _write_json(QA_FILE, data)
-    return jsonify({'ok': True, 'total': len(data)})
+        _firebase_delete(f'qa/{qa_id}')
+    return jsonify({'ok': True})
 
 
 # ─── タグ API ───
@@ -656,16 +705,14 @@ def api_add_tag():
         if existing:
             return jsonify(existing)
         new_tag = {'id': f'tag_{uuid.uuid4().hex[:8]}', 'name': name}
-        tags.append(new_tag)
-        _write_json(TAGS_FILE, tags)
+        _firebase_put(f'tags/{new_tag["id"]}', new_tag)
     return jsonify(new_tag)
 
 
 @app.route('/api/tags/<tag_id>', methods=['DELETE'])
 def api_delete_tag(tag_id):
     with _data_lock:
-        tags = [t for t in _get_tags() if t['id'] != tag_id]
-        _write_json(TAGS_FILE, tags)
+        _firebase_delete(f'tags/{tag_id}')
     return jsonify({'ok': True})
 
 
@@ -680,9 +727,7 @@ def api_get_settings():
 def api_save_settings():
     updates = request.json
     with _data_lock:
-        settings = _get_settings()
-        settings.update(updates)
-        _write_json(SETTINGS_FILE, settings)
+        _firebase_patch('settings', updates)
     return jsonify({'ok': True})
 
 
@@ -693,7 +738,7 @@ def api_export():
         data = {
             'version': 1,
             'exportedAt': time.strftime('%Y-%m-%dT%H:%M:%S+09:00'),
-            'qaData': _read_json(QA_FILE),
+            'qaData': _get_qa_list(),
             'tags': _get_tags()
         }
     return jsonify(data)
@@ -705,26 +750,27 @@ def api_import():
     if not imported or 'qaData' not in imported:
         return jsonify({'error': 'Invalid format'}), 400
     with _data_lock:
-        existing = _read_json(QA_FILE)
+        existing = _get_qa_list()
         existing_ids = {qa['id'] for qa in existing}
         new_items = [qa for qa in imported['qaData'] if qa['id'] not in existing_ids]
-        merged = new_items + existing
-        _write_json(QA_FILE, merged)
+        if new_items:
+            batch = {item['id']: item for item in new_items}
+            _firebase_patch('qa', batch)
         if 'tags' in imported:
-            tags = _get_tags()
-            tag_ids = {t['id'] for t in tags}
-            for tag in imported['tags']:
-                if tag['id'] not in tag_ids:
-                    tags.append(tag)
-            _write_json(TAGS_FILE, tags)
-    return jsonify({'imported': len(new_items), 'total': len(merged)})
+            current_tags = _get_tags()
+            tag_ids = {t['id'] for t in current_tags}
+            new_tags = {tag['id']: tag for tag in imported['tags'] if tag['id'] not in tag_ids}
+            if new_tags:
+                _firebase_patch('tags', new_tags)
+    return jsonify({'imported': len(new_items), 'total': len(existing) + len(new_items)})
 
 
 @app.route('/api/clear', methods=['POST'])
 def api_clear():
     with _data_lock:
-        _write_json(QA_FILE, [])
-        _write_json(TAGS_FILE, DEFAULT_TAGS)
+        _firebase_put('qa', {})
+        tags_dict = {t['id']: t for t in DEFAULT_TAGS}
+        _firebase_put('tags', tags_dict)
     return jsonify({'ok': True})
 
 
@@ -733,7 +779,7 @@ def api_clear():
 # ═══════════════════════════════════════════════════
 def _search_relevant_qa(query, max_results=10):
     """Q&Aデータからクエリに関連するエントリを検索"""
-    qa_data = _read_json(QA_FILE)
+    qa_data = _get_qa_list()
     if not qa_data:
         return []
 
@@ -966,10 +1012,7 @@ def _gemini_extract_qa(text, source=''):
                 tag_ids.append(tag_name_to_id[clean])
             else:
                 new_tag = {'id': f'tag_{uuid.uuid4().hex[:8]}', 'name': clean}
-                with _data_lock:
-                    tags_list = _get_tags()
-                    tags_list.append(new_tag)
-                    _write_json(TAGS_FILE, tags_list)
+                _firebase_put(f'tags/{new_tag["id"]}', new_tag)
                 tag_name_to_id[clean] = new_tag['id']
                 tag_ids.append(new_tag['id'])
 
@@ -987,14 +1030,15 @@ def _gemini_extract_qa(text, source=''):
 # AI音声用_出力 フォルダ監視
 # ═══════════════════════════════════════════════════
 def _get_processed_files():
-    return set(_read_json(PROCESSED_FILE, []))
+    data = _firebase_get('processed_files', [])
+    return set(data) if isinstance(data, list) else set()
 
 
 def _add_processed_file(filepath):
     with _data_lock:
         processed = _get_processed_files()
         processed.add(filepath)
-        _write_json(PROCESSED_FILE, list(processed))
+        _firebase_put('processed_files', list(processed))
 
 
 def _watch_ai_output():
@@ -1066,9 +1110,8 @@ def _watch_ai_output():
                         } for item in qa_items]
 
                         with _data_lock:
-                            data = _read_json(QA_FILE)
-                            data = new_items + data
-                            _write_json(QA_FILE, data)
+                            batch = {item['id']: item for item in new_items}
+                            _firebase_patch('qa', batch)
 
                         print(f'  ✅ {len(new_items)}件のQ&Aを保存しました')
                     else:
