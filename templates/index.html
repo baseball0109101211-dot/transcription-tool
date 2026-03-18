@@ -721,6 +721,10 @@ ${text}
                 for (const task of activeTasks) {
                     try {
                         const res = await fetch(`/status/${task.task_id}`);
+                        if (res.status === 404) {
+                            updateTaskUI(task.task_id, { status: 'error', message: 'サーバーが再起動しました。ページを更新して再アップロードしてください。' });
+                            continue;
+                        }
                         const data = await res.json();
                         task.data = data;
                         updateTaskUI(task.task_id, data);
@@ -767,7 +771,7 @@ ${text}
             if (!statusEl) return;
 
             if (data.status === 'completed') {
-                statusEl.innerHTML = `<span class="status-done">✅ ${data.message}</span>`;
+                statusEl.innerHTML = `<span class="status-done">✅ ${data.message || '完了'}</span>`;
                 const progressEl = document.getElementById(`progress-${taskId}`);
                 const trackEl = document.getElementById(`progress-track-${taskId}`);
                 if (progressEl) progressEl.style.width = '100%';
@@ -782,12 +786,12 @@ ${text}
                 `;
                 cardEl.classList.add('completed');
             } else if (data.status === 'error') {
-                statusEl.innerHTML = `<span class="status-error">❌ ${data.message}</span>`;
+                statusEl.innerHTML = `<span class="status-error">❌ ${data.message || 'エラーが発生しました'}</span>`;
                 const trackEl = document.getElementById(`progress-track-${taskId}`);
                 if (trackEl) trackEl.style.display = 'none';
                 cardEl.classList.add('error');
             } else {
-                statusEl.innerHTML = `<div class="spinner-small"></div><span>${data.message}</span>`;
+                statusEl.innerHTML = `<div class="spinner-small"></div><span>${data.message || '処理中...'}</span>`;
                 const progressEl = document.getElementById(`progress-${taskId}`);
                 if (progressEl && data.progress) progressEl.style.width = data.progress + '%';
             }
