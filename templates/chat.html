@@ -641,7 +641,7 @@
                 </div>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>➤</button>
             </div>
-            <div class="input-hint">Enter で送信 / Shift+Enter で改行</div>
+            <div class="input-hint">Shift+Enter で送信 / Enter で改行</div>
         </div>
 
         <div class="status-bar">
@@ -787,7 +787,7 @@
         function toggleRefs(btn) { const l = btn.nextElementSibling; l.classList.toggle('show'); btn.textContent = l.classList.contains('show') ? `📖 参照ナレッジを非表示 ▲` : `📖 参照ナレッジを表示 ▼`; }
         function scrollToBottom() { requestAnimationFrame(() => { chatArea.scrollTop = chatArea.scrollHeight }); }
         function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
-        function handleKeyDown(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
+        function handleKeyDown(e) { if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); sendMessage(); } }
         function newChat() {
             if (chatHistory.length > 0 && !confirm('現在のチャットを消して新しくはじめますか？')) return;
             chatHistory = []; localStorage.removeItem(HISTORY_KEY);
