@@ -1240,6 +1240,27 @@ body::before {
     font-size: 12px;
 }
 
+.qa-load-more {
+    display: block;
+    width: 100%;
+    padding: 14px;
+    margin-top: 12px;
+    border: 1px dashed var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--accent-light);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.qa-load-more:hover {
+    background: rgba(99, 102, 241, 0.08);
+    border-color: var(--accent);
+    transform: translateY(-1px);
+}
+
 /* ─── Text Input Tab ─── */
 .text-input-section {
     margin-bottom: 20px;

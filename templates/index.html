@@ -992,13 +992,18 @@ ${text}
         // ═══════════════════════════════════════════════════
         // Q&A Library Rendering
         // ═══════════════════════════════════════════════════
+        let qaDisplayLimit = 50;
+
         function renderQALibrary() {
             const query = document.getElementById('qaSearchInput')?.value || '';
             const qaData = Storage.searchQA(query, activeTagFilters.length > 0 ? activeTagFilters : null);
             const stats = Storage.getStats();
             const allTags = TagManager.getAll();
 
-            document.getElementById('qaStats').textContent = `${stats.totalQA}件のQ&A`;
+            const totalStr = query || activeTagFilters.length > 0
+                ? `${qaData.length}件 / ${stats.totalQA}件`
+                : `${stats.totalQA}件のQ&A`;
+            document.getElementById('qaStats').textContent = totalStr;
 
             // Tag filters
             const filtersEl = document.getElementById('qaTagFilters');
@@ -1016,14 +1021,17 @@ ${text}
                 listEl.innerHTML = `
                     <div class="qa-empty">
                         <span class="qa-empty-icon">📭</span>
-                        <div class="qa-empty-text">まだQ&Aがありません</div>
-                        <div class="qa-empty-subtext">音声ファイルを文字起こしするか、テキストを入力してQ&Aを抽出しましょう</div>
+                        <div class="qa-empty-text">${query ? '検索結果がありません' : 'まだQ&Aがありません'}</div>
+                        <div class="qa-empty-subtext">${query ? '別のキーワードで検索してみてください' : '音声ファイルを文字起こしするか、テキストを入力してQ&Aを抽出しましょう'}</div>
                     </div>
                 `;
                 return;
             }
 
-            listEl.innerHTML = qaData.map(qa => {
+            const displayData = qaData.slice(0, qaDisplayLimit);
+            const hasMore = qaData.length > qaDisplayLimit;
+
+            listEl.innerHTML = displayData.map(qa => {
                 const tagNames = (qa.tags || []).map(tagId => {
                     const tag = TagManager.getById(tagId);
                     return tag ? `<span class="qa-tag">${tag.name}</span>` : '';
@@ -1047,6 +1055,19 @@ ${text}
                     </div>
                 `;
             }).join('');
+
+            if (hasMore) {
+                listEl.innerHTML += `
+                    <button class="qa-load-more" onclick="loadMoreQA()">
+                        📚 もっと読み込む（残り ${qaData.length - qaDisplayLimit}件）
+                    </button>
+                `;
+            }
+        }
+
+        function loadMoreQA() {
+            qaDisplayLimit += 50;
+            renderQALibrary();
         }
 
         function escapeHTML(str) {
