@@ -383,6 +383,49 @@
             line-height: 1.4;
         }
 
+        .ref-source {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 3px;
+        }
+
+        .ref-tags {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+            margin-top: 4px;
+        }
+
+        .ref-tag {
+            font-size: 10px;
+            padding: 1px 6px;
+            border-radius: 4px;
+            background: rgba(99, 102, 241, 0.15);
+            color: var(--accent-light);
+        }
+
+        .knowledge-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(139, 92, 246, 0.15));
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 8px;
+            font-size: 12px;
+            color: var(--accent-light);
+            margin-bottom: 8px;
+        }
+
+        .knowledge-badge-count {
+            background: var(--accent);
+            color: white;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 11px;
+        }
+
         .typing-indicator {
             display: flex;
             align-items: center;
@@ -695,10 +738,13 @@
 
             let refsHTML = '';
             if (!isUser && msg.references && msg.references.length > 0) {
-                const items = msg.references.map(r =>
-                    `<div class="ref-item"><div class="ref-q">Q: ${esc(r.question)}</div><div class="ref-a">${esc(r.answer)}${r.tags?.length ? ` [${r.tags.join(', ')}]` : ''}</div></div>`
-                ).join('');
-                refsHTML = `<div class="msg-refs"><button class="refs-toggle" onclick="toggleRefs(this)">📚 参照ナレッジ ${msg.qa_count}件 ▼</button><div class="refs-list">${items}</div></div>`;
+                const items = msg.references.map(r => {
+                    const tagsHTML = r.tags?.length ? `<div class="ref-tags">${r.tags.map(t => `<span class="ref-tag">${esc(t)}</span>`).join('')}</div>` : '';
+                    const sourceHTML = r.source ? `<div class="ref-source">📎 ${esc(r.source)}</div>` : '';
+                    return `<div class="ref-item"><div class="ref-q">Q: ${esc(r.question)}</div><div class="ref-a">${esc(r.answer)}</div>${tagsHTML}${sourceHTML}</div>`;
+                }).join('');
+                const badgeHTML = `<div class="knowledge-badge">📚 ナレッジ活用 <span class="knowledge-badge-count">${msg.qa_count}件</span></div>`;
+                refsHTML = `${badgeHTML}<div class="msg-refs"><button class="refs-toggle" onclick="toggleRefs(this)">📖 参照ナレッジを表示 (${msg.qa_count}件) ▼</button><div class="refs-list">${items}</div></div>`;
             }
 
             div.innerHTML = `
@@ -738,7 +784,7 @@
             h = h.replace(/\n/g, '<br>');
             return h;
         }
-        function toggleRefs(btn) { const l = btn.nextElementSibling; l.classList.toggle('show'); btn.textContent = l.classList.contains('show') ? '📚 参照ナレッジ ▲' : '📚 参照ナレッジ ▼'; }
+        function toggleRefs(btn) { const l = btn.nextElementSibling; l.classList.toggle('show'); btn.textContent = l.classList.contains('show') ? `📖 参照ナレッジを非表示 ▲` : `📖 参照ナレッジを表示 ▼`; }
         function scrollToBottom() { requestAnimationFrame(() => { chatArea.scrollTop = chatArea.scrollHeight }); }
         function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
         function handleKeyDown(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
