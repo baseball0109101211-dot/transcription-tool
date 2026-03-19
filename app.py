@@ -790,8 +790,8 @@ def api_clear():
 # ═══════════════════════════════════════════════════
 # 壁打ちAI チャット API
 # ═══════════════════════════════════════════════════
-def _search_relevant_qa(query, max_results=10):
-    """Q&Aデータからクエリに関連するエントリを検索"""
+def _search_relevant_qa(query, max_results=None):
+    """Q&Aデータからクエリに関連するエントリを検索（上限なし：マッチする全件を返す）"""
     qa_data = _get_qa_list()
     if not qa_data:
         return []
@@ -821,7 +821,9 @@ def _search_relevant_qa(query, max_results=10):
             scored.append((score, qa))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [item[1] for item in scored[:max_results]]
+    if max_results:
+        return [item[1] for item in scored[:max_results]]
+    return [item[1] for item in scored]
 
 
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
