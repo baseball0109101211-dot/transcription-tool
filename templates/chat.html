@@ -389,6 +389,34 @@
             margin-top: 3px;
         }
 
+        .source-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 8px;
+            margin-bottom: 4px;
+        }
+
+        .source-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 10px;
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.25);
+            border-radius: 6px;
+            font-size: 11px;
+            color: var(--accent-light);
+            white-space: nowrap;
+            max-width: 250px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .source-badge-icon {
+            flex-shrink: 0;
+        }
+
         .ref-tags {
             display: flex;
             gap: 4px;
@@ -571,6 +599,121 @@
             background: #ef4444;
         }
 
+        .feedback-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 4px;
+        }
+
+        .fb-btn {
+            padding: 4px 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: transparent;
+            color: var(--text-muted);
+            font-size: 14px;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .fb-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent-light);
+        }
+
+        .fb-btn.selected-good {
+            background: rgba(34, 197, 94, 0.15);
+            border-color: #22c55e;
+            color: #22c55e;
+        }
+
+        .fb-btn.selected-bad {
+            background: rgba(239, 68, 68, 0.15);
+            border-color: #ef4444;
+            color: #ef4444;
+        }
+
+        .fb-label {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .correction-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.6);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .correction-modal.show {
+            display: flex;
+        }
+
+        .correction-box {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            max-width: 500px;
+            width: 90%;
+        }
+
+        .correction-box h3 {
+            font-size: 16px;
+            margin-bottom: 12px;
+            color: var(--text-primary);
+        }
+
+        .correction-box textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-input);
+            color: var(--text-primary);
+            font-size: 14px;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 100px;
+            outline: none;
+        }
+
+        .correction-box textarea:focus {
+            border-color: var(--accent);
+        }
+
+        .correction-btns {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+            justify-content: flex-end;
+        }
+
+        .correction-btns button {
+            padding: 8px 20px;
+            border-radius: 8px;
+            border: none;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .btn-cancel {
+            background: var(--bg-chat);
+            color: var(--text-secondary);
+        }
+
+        .btn-submit {
+            background: var(--accent);
+            color: white;
+        }
+
         @media (max-width:600px) {
             .header {
                 padding: 12px 16px
@@ -642,6 +785,19 @@
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>➤</button>
             </div>
             <div class="input-hint">Shift+Enter で送信 / Enter で改行</div>
+        </div>
+
+        <div class="correction-modal" id="correctionModal">
+            <div class="correction-box">
+                <h3>✏️ こう言ってほしかった</h3>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">
+                    ひよさんならどう回答しますか？修正内容はナレッジとして学習されます。</p>
+                <textarea id="correctionText" placeholder="ひよさんならこう答えるはず..."></textarea>
+                <div class="correction-btns">
+                    <button class="btn-cancel" onclick="closeCorrection()">キャンセル</button>
+                    <button class="btn-submit" onclick="submitCorrection()">💾 保存して学習</button>
+                </div>
+            </div>
         </div>
 
         <div class="status-bar">
@@ -717,7 +873,7 @@
                 if (data.error) {
                     renderError(data.error);
                 } else {
-                    const aiMsg = { role: 'ai', content: data.response, references: data.references || [], qa_count: data.qa_count || 0, time: new Date().toISOString() };
+                    const aiMsg = { role: 'ai', content: data.response, references: data.references || [], qa_count: data.qa_count || 0, ref_count: data.ref_count || 0, time: new Date().toISOString() };
                     chatHistory.push(aiMsg);
                     renderMessage(aiMsg);
                 }
@@ -737,14 +893,48 @@
             const time = msg.time ? new Date(msg.time).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }) : '';
 
             let refsHTML = '';
-            if (!isUser && msg.references && msg.references.length > 0) {
-                const items = msg.references.map(r => {
-                    const tagsHTML = r.tags?.length ? `<div class="ref-tags">${r.tags.map(t => `<span class="ref-tag">${esc(t)}</span>`).join('')}</div>` : '';
-                    const sourceHTML = r.source ? `<div class="ref-source">📎 ${esc(r.source)}</div>` : '';
-                    return `<div class="ref-item"><div class="ref-q">Q: ${esc(r.question)}</div><div class="ref-a">${esc(r.answer)}</div>${tagsHTML}${sourceHTML}</div>`;
-                }).join('');
-                const badgeHTML = `<div class="knowledge-badge">📚 ナレッジ活用 <span class="knowledge-badge-count">${msg.qa_count}件</span></div>`;
-                refsHTML = `${badgeHTML}<div class="msg-refs"><button class="refs-toggle" onclick="toggleRefs(this)">📖 参照ナレッジを表示 (${msg.qa_count}件) ▼</button><div class="refs-list">${items}</div></div>`;
+            if (!isUser) {
+                const qc = msg.qa_count || 0;
+                const rc = msg.ref_count || msg.references?.length || 0;
+                const badgeClass = qc > 0 ? '' : ' style="opacity:0.5"';
+                const badgeHTML = `<div class="knowledge-badge"${badgeClass}>📚 ナレッジ活用 <span class="knowledge-badge-count">${qc}件</span></div>`;
+
+                // ソースバッジ（どの情報源から来ているかを表示）
+                let sourceBadgesHTML = '';
+                if (msg.references && msg.references.length > 0) {
+                    const uniqueSources = [...new Set(msg.references.map(r => r.source).filter(s => s && s.trim()))];
+                    if (uniqueSources.length > 0) {
+                        const badges = uniqueSources.slice(0, 5).map(s => {
+                            const icon = s.startsWith('Loom') ? '🎬' : s.includes('Voicy') ? '🎙️' : '📄';
+                            const label = s.length > 35 ? s.slice(0, 35) + '…' : s;
+                            return `<span class="source-badge"><span class="source-badge-icon">${icon}</span>${esc(label)}</span>`;
+                        }).join('');
+                        const moreText = uniqueSources.length > 5 ? `<span class="source-badge">+${uniqueSources.length - 5}件</span>` : '';
+                        sourceBadgesHTML = `<div class="source-badges">${badges}${moreText}</div>`;
+                    }
+                }
+
+                if (msg.references && msg.references.length > 0) {
+                    const items = msg.references.map(r => {
+                        const tagsHTML = r.tags?.length ? `<div class="ref-tags">${r.tags.map(t => `<span class="ref-tag">${esc(t)}</span>`).join('')}</div>` : '';
+                        const sourceHTML = r.source ? `<div class="ref-source">📎 ${esc(r.source)}</div>` : '';
+                        return `<div class="ref-item"><div class="ref-q">Q: ${esc(r.question)}</div><div class="ref-a">${esc(r.answer)}</div>${tagsHTML}${sourceHTML}</div>`;
+                    }).join('');
+                    const showLabel = qc > rc ? `上位${rc}件を表示（全${qc}件中）` : `${rc}件`;
+                    refsHTML = `${badgeHTML}${sourceBadgesHTML}<div class="msg-refs"><button class="refs-toggle" onclick="toggleRefs(this)">📖 参照ナレッジを表示 (${showLabel}) ▼</button><div class="refs-list">${items}</div></div>`;
+                } else {
+                    refsHTML = badgeHTML + sourceBadgesHTML;
+                }
+            }
+
+            let feedbackHTML = '';
+            if (!isUser) {
+                const idx = chatHistory.filter(m => m.role === 'ai').length;
+                feedbackHTML = `<div class="feedback-row">
+                    <button class="fb-btn" onclick="sendFeedback(this,'good',${idx})" title="良い回答">👍</button>
+                    <button class="fb-btn" onclick="sendFeedback(this,'bad',${idx})" title="改善が必要">👎</button>
+                    <span class="fb-label">この回答はひよさんっぽい？</span>
+                </div>`;
             }
 
             div.innerHTML = `
@@ -752,6 +942,7 @@
             <div class="msg-content">
                 <div class="msg-bubble">${isUser ? esc(msg.content) : fmt(msg.content)}</div>
                 ${refsHTML}
+                ${feedbackHTML}
                 <div class="msg-time">${time}</div>
             </div>`;
             chatArea.appendChild(div);
@@ -784,7 +975,7 @@
             h = h.replace(/\n/g, '<br>');
             return h;
         }
-        function toggleRefs(btn) { const l = btn.nextElementSibling; l.classList.toggle('show'); btn.textContent = l.classList.contains('show') ? `📖 参照ナレッジを非表示 ▲` : `📖 参照ナレッジを表示 ▼`; }
+        function toggleRefs(btn) { const l = btn.nextElementSibling; l.classList.toggle('show'); const count = btn.dataset.count || ''; btn.textContent = l.classList.contains('show') ? `📖 参照ナレッジを非表示 ▲` : `📖 参照ナレッジを表示 ▼`; }
         function scrollToBottom() { requestAnimationFrame(() => { chatArea.scrollTop = chatArea.scrollHeight }); }
         function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
         function handleKeyDown(e) { if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); sendMessage(); } }
@@ -794,6 +985,73 @@
             chatArea.innerHTML = ''; chatArea.appendChild(welcome); welcome.style.display = '';
         }
         function saveHistory() { localStorage.setItem(HISTORY_KEY, JSON.stringify(chatHistory.slice(-50))); }
+
+        // ── フィードバック機能 ──
+        let currentFeedbackIdx = -1;
+        async function sendFeedback(btn, rating, aiIdx) {
+            const row = btn.parentElement;
+            row.querySelectorAll('.fb-btn').forEach(b => b.classList.remove('selected-good', 'selected-bad'));
+            btn.classList.add(rating === 'good' ? 'selected-good' : 'selected-bad');
+
+            const aiMsgs = chatHistory.filter(m => m.role === 'ai');
+            const aiMsg = aiMsgs[aiIdx - 1] || aiMsgs[aiMsgs.length - 1];
+            const prevUser = chatHistory[chatHistory.indexOf(aiMsg) - 1];
+
+            if (rating === 'bad') {
+                currentFeedbackIdx = aiIdx;
+                document.getElementById('correctionModal').classList.add('show');
+                return;
+            }
+
+            try {
+                await fetch('/api/feedback', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        rating,
+                        question: prevUser?.content || '',
+                        ai_response: aiMsg?.content || ''
+                    })
+                });
+                row.querySelector('.fb-label').textContent = '👍 ありがとう！';
+            } catch (e) { console.error(e); }
+        }
+
+        function closeCorrection() {
+            document.getElementById('correctionModal').classList.remove('show');
+            document.getElementById('correctionText').value = '';
+        }
+
+        async function submitCorrection() {
+            const correction = document.getElementById('correctionText').value.trim();
+            if (!correction) return;
+
+            const aiMsgs = chatHistory.filter(m => m.role === 'ai');
+            const aiMsg = aiMsgs[currentFeedbackIdx - 1] || aiMsgs[aiMsgs.length - 1];
+            const prevUser = chatHistory[chatHistory.indexOf(aiMsg) - 1];
+
+            try {
+                await fetch('/api/feedback', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        rating: 'bad',
+                        question: prevUser?.content || '',
+                        ai_response: aiMsg?.content || '',
+                        correction
+                    })
+                });
+            } catch (e) { console.error(e); }
+
+            closeCorrection();
+            // UIに反映
+            const labels = document.querySelectorAll('.fb-label');
+            if (labels.length > 0) labels[labels.length - 1].textContent = '✏️ 修正を学習しました！';
+        }
+
+        document.getElementById('correctionModal').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('correctionModal')) closeCorrection();
+        });
 
         init();
     </script>
