@@ -790,40 +790,232 @@ def api_clear():
 # ═══════════════════════════════════════════════════
 # 壁打ちAI チャット API
 # ═══════════════════════════════════════════════════
-def _search_relevant_qa(query, max_results=None):
-    """Q&Aデータからクエリに関連するエントリを検索（上限なし：マッチする全件を返す）"""
+# ── ベクトル検索用のエンベディングキャッシュ ──
+_embedding_cache = {}
+_embedding_cache_loaded = False
+
+
+def _load_embeddings():
+    """エンベディングファイルをメモリにロード"""
+    global _embedding_cache, _embedding_cache_loaded
+    if _embedding_cache_loaded:
+        return
+    embed_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'qa_embeddings.json')
+    if os.path.exists(embed_file):
+        try:
+            with open(embed_file, 'r') as f:
+                _embedding_cache = json.load(f)
+            print(f'📦 エンベディング読込: {len(_embedding_cache)}件')
+        except Exception as e:
+            print(f'⚠️ エンベディング読込エラー: {e}')
+    _embedding_cache_loaded = True
+
+
+def _embed_query(text, api_key):
+    """クエリをベクトル化"""
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}'
+    payload = json.dumps({
+        'model': 'models/gemini-embedding-001',
+        'content': {'parts': [{'text': text[:2000]}]},
+        'taskType': 'RETRIEVAL_QUERY'
+    }).encode('utf-8')
+    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        result = json.loads(r.read().decode())
+    return result['embedding']['values']
+
+
+def _cosine_sim(a, b):
+    """コサイン類似度を計算"""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _search_relevant_qa(query, max_results=30):
+    """Q&Aデータからクエリに関連するエントリを検索（ハイブリッド検索）"""
+    _load_embeddings()
+
+    settings = _get_settings()
+    api_key = settings.get('gemini_api_key')
+
+    # ═══ ①クエリ拡張: 質問を多角的な検索クエリに展開 ═══
+    search_queries = [query]
+    if api_key:
+        try:
+            expand_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}'
+            expand_payload = json.dumps({
+                'contents': [{'parts': [{'text': f'以下の質問を、意味が近い別の言い回しで2つ作ってください。1行に1つ、番号なしで出力。\n質問: {query}'}]}],
+                'generationConfig': {'temperature': 0.3, 'maxOutputTokens': 200}
+            }).encode('utf-8')
+            expand_req = urllib.request.Request(expand_url, data=expand_payload, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(expand_req, timeout=10) as r:
+                expand_result = json.loads(r.read().decode())
+            expanded = expand_result['candidates'][0]['content']['parts'][0]['text'].strip().split('\n')
+            search_queries.extend([q.strip() for q in expanded if q.strip() and len(q.strip()) > 3][:2])
+        except Exception as e:
+            pass  # 拡張できなくてもオリジナルクエリで続行
+
+    # ═══ ベクトル検索（全クエリで実行）═══
+    vector_scores = {}
+    if _embedding_cache and api_key:
+        try:
+            for sq in search_queries:
+                query_vec = _embed_query(sq, api_key)
+                for qa_id, data in _embedding_cache.items():
+                    emb = data.get('embedding', [])
+                    if emb:
+                        sim = _cosine_sim(query_vec, emb)
+                        # 複数クエリの最大スコアを採用
+                        if sim > vector_scores.get(qa_id, 0):
+                            vector_scores[qa_id] = sim
+        except Exception as e:
+            print(f'⚠️ ベクトル検索エラー: {e}')
+
+    # ═══ キーワード検索（全クエリで実行）═══
     qa_data = _get_qa_list()
     if not qa_data:
-        return []
+        return [], 0
 
-    query_lower = query.lower()
-    keywords = [w for w in query_lower.split() if len(w) > 1]
+    all_keywords = set()
+    for sq in search_queries:
+        sq_lower = sq.lower()
+        space_words = [w for w in sq_lower.split() if len(w) > 1]
+        if len(space_words) <= 1 and len(sq_lower.replace(' ', '')) > 2:
+            clean = sq_lower.replace(' ', '')
+            for i in range(len(clean) - 1):
+                all_keywords.add(clean[i:i+2])
+        else:
+            all_keywords.update(space_words)
 
+    # ═══ ⑤ソース別重み & ⑥時系列重み ═══
+    SOURCE_WEIGHTS = {
+        'Voicy': 1.5, 'voicy': 1.5,
+        'ChatGPT': 1.3, 'chatgpt': 1.3,
+        'テキスト入力': 1.2,
+        '✏️ フィードバック修正': 1.4,
+    }
+    import datetime
+    now_ts = datetime.datetime.now().timestamp()
+
+    # ═══ ハイブリッドスコアリング（候補を広く80件取得）═══
     scored = []
     for qa in qa_data:
-        score = 0
+        qa_id = qa.get('id', '')
+        answer = qa.get('answer', '')
+        if len(answer) < 20:
+            continue
+
+        # キーワードスコア
+        kw_score = 0
         q_lower = qa.get('question', '').lower()
-        a_lower = qa.get('answer', '').lower()
+        a_lower = answer.lower()
         combined = q_lower + ' ' + a_lower
+        query_lower = query.lower()
 
-        # キーワードマッチ
-        for kw in keywords:
+        for kw in all_keywords:
             if kw in q_lower:
-                score += 3
+                kw_score += 3
             if kw in a_lower:
-                score += 2
-
-        # 完全クエリマッチ
+                kw_score += 2
         if query_lower in combined:
-            score += 5
+            kw_score += 5
 
-        if score > 0:
-            scored.append((score, qa))
+        # ベクトルスコア
+        vec_score = vector_scores.get(qa_id, 0) * 10
+
+        # ハイブリッド
+        if vector_scores:
+            hybrid = vec_score * 0.7 + kw_score * 0.3
+        else:
+            hybrid = kw_score
+
+        # ⑤ソース重み
+        source = qa.get('source', '')
+        source_weight = 1.0
+        for src_key, weight in SOURCE_WEIGHTS.items():
+            if src_key in source:
+                source_weight = weight
+                break
+        hybrid *= source_weight
+
+        # ⑥時系列重み（新しいほどボーナス）
+        created = qa.get('createdAt', '')
+        if created:
+            try:
+                # ISO形式のタイムスタンプをパース
+                if 'T' in created:
+                    dt = datetime.datetime.fromisoformat(created.replace('+09:00', '+09:00').replace('Z', '+00:00'))
+                    age_days = (now_ts - dt.timestamp()) / 86400
+                    # 30日以内 → ×1.3, 90日以内 → ×1.15, それ以外 → ×1.0
+                    if age_days < 30:
+                        hybrid *= 1.3
+                    elif age_days < 90:
+                        hybrid *= 1.15
+            except Exception:
+                pass
+
+        if hybrid > 0.5:
+            scored.append((hybrid, qa))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    if max_results:
-        return [item[1] for item in scored[:max_results]]
-    return [item[1] for item in scored]
+    total_matched = len(scored)
+
+    # ═══ ②Re-rank: 上位50件をGeminiで絞り込み15件に → 残りから15件追加 → 計30件 ═══
+    candidates = scored[:50]
+    if len(candidates) > 20 and api_key:
+        try:
+            q_list = '\n'.join([f"{i+1}. {item[1].get('question','')}" for i, item in enumerate(candidates[:50])])
+            rerank_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}'
+            rerank_payload = json.dumps({
+                'contents': [{'parts': [{'text': f'ユーザーの質問: 「{query}」\n\n以下の質問リストから、ユーザーの質問に最も関連が深い順に15個の番号だけを出力してください。カンマ区切りで番号のみ。\n\n{q_list}'}]}],
+                'generationConfig': {'temperature': 0.0, 'maxOutputTokens': 200}
+            }).encode('utf-8')
+            rerank_req = urllib.request.Request(rerank_url, data=rerank_payload, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(rerank_req, timeout=15) as r:
+                rerank_result = json.loads(r.read().decode())
+            indices_text = rerank_result['candidates'][0]['content']['parts'][0]['text'].strip()
+            # 数字を抽出
+            import re
+            indices = [int(x) - 1 for x in re.findall(r'\d+', indices_text) if 0 < int(x) <= len(candidates)]
+            reranked = [candidates[i] for i in indices[:15] if i < len(candidates)]
+            # Re-rank結果 + 残りから補完して30件に
+            remaining = [c for c in candidates if c not in reranked]
+            results = [item[1] for item in reranked] + [item[1] for item in remaining[:max_results - len(reranked)]]
+            return results[:max_results], total_matched
+        except Exception as e:
+            pass  # Re-rank失敗時はフォールバック
+
+    results = [item[1] for item in scored[:max_results]]
+    return results, total_matched
+
+
+def _auto_embed_qa(qa_id, question, answer, api_key):
+    """新しいQ&Aを自動的にベクトル化してキャッシュに追加"""
+    global _embedding_cache
+    _load_embeddings()
+    if qa_id in _embedding_cache:
+        return
+    try:
+        text = f"Q: {question}\nA: {answer}"
+        vec = _embed_query(text, api_key)  # RETRIEVAL_QUERYだが問題ない
+        _embedding_cache[qa_id] = {
+            'embedding': vec,
+            'question': question,
+            'answer': answer,
+            'source': '',
+            'tags': []
+        }
+        # ファイルに追記保存（既存データが消えないようガード）
+        if len(_embedding_cache) > 100:
+            embed_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'qa_embeddings.json')
+            with open(embed_file, 'w') as f:
+                json.dump(_embedding_cache, f, ensure_ascii=False)
+    except Exception as e:
+        print(f'⚠️ 自動エンベディングエラー: {e}')
 
 
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
@@ -850,42 +1042,165 @@ def api_chat():
         resp.headers['Access-Control-Allow-Origin'] = '*'
         return resp, 400
 
-    # 関連Q&Aを検索
-    relevant_qa = _search_relevant_qa(user_message)
+    # 関連Q&Aを検索（上位30件 + 総マッチ数）
+    relevant_qa, total_matched = _search_relevant_qa(user_message, max_results=30)
     tags = _get_tags()
     tag_map = {t['id']: t['name'] for t in tags}
 
-    # コンテキスト構築
+    # コンテキスト構築（階層型: 上位ほど詳しい情報を提供）
     context_parts = []
     references = []
-    for qa in relevant_qa:
+    for i, qa in enumerate(relevant_qa):
         tag_names = [tag_map.get(tid, '') for tid in qa.get('tags', []) if tag_map.get(tid)]
         tags_str = f" [{', '.join(tag_names)}]" if tag_names else ''
-        context_parts.append(f"Q: {qa['question']}\nA: {qa['answer']}{tags_str}")
+        source = qa.get('source', '')
+        source_str = f"\n出典: {source}" if source else ''
+        answer = qa.get('answer', '')
+
+        # 階層型コンテキスト: 上位5件=全文, 6-15件=要約, 16-30件=質問のみ
+        if i < 5:
+            # 上位5件: 全文（最重要）
+            context_parts.append(f"【ナレッジ{i+1}】★重要\nQ: {qa['question']}\nA: {answer}{tags_str}{source_str}")
+        elif i < 15:
+            # 6-15件: 回答を300文字に要約
+            short_answer = answer[:300] + ('...' if len(answer) > 300 else '')
+            context_parts.append(f"【ナレッジ{i+1}】\nQ: {qa['question']}\nA: {short_answer}{tags_str}")
+        else:
+            # 16-30件: 質問のみ（キーワードの幅を広げる用途）
+            context_parts.append(f"【ナレッジ{i+1}】Q: {qa['question']}{tags_str}")
+
         references.append({
             'question': qa['question'],
-            'answer': qa['answer'][:200] + ('...' if len(qa.get('answer', '')) > 200 else ''),
+            'answer': answer[:200] + ('...' if len(answer) > 200 else ''),
+            'source': source,
             'tags': [tag_map.get(tid, '') for tid in qa.get('tags', []) if tag_map.get(tid)]
         })
 
     context_text = '\n\n---\n\n'.join(context_parts) if context_parts else '（関連するナレッジが見つかりませんでした）'
 
-    system_prompt = f"""あなたは「壁打ちAI」です。ユーザーの仕事やビジネスについて、蓄積されたナレッジベースの知識を使って回答・アドバイスする親しみやすいAIアシスタントです。
+    # ペルソナプロファイル読み込み
+    persona_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+    persona_text = ''
+    try:
+        with open(os.path.join(persona_dir, 'persona_profile.md'), 'r', encoding='utf-8') as f:
+            persona_text = f.read()
+    except FileNotFoundError:
+        persona_text = ''
 
-## あなたの役割:
-- ユーザーのビジネスに関する質問に、ナレッジベースの情報を活用して具体的に回答する
-- 壁打ち相手として、アイデアの深掘りや新しい視点を提供する
-- 実践的で具体的なアドバイスを心がける
-- フランクで親しみやすい口調で話す
+    system_prompt = f"""あなたは「ひよ」さん本人として振る舞うAIです。単なるチャットボットではなく、ひよさんの**思考パターン・判断軸・価値観・口調**を完全に再現した「デジタルツイン」です。
 
-## ナレッジベースから取得した関連情報:
+相談者は、あなたを「ひよさん」だと思って相談してきます。ひよさんが実際にその場にいたら答えるであろう内容を、ひよさんの言葉で回答してください。
+
+═══════════════════════════════════
+## ひよさんのペルソナ（あなた自身の人格）
+═══════════════════════════════════
+{persona_text}
+
+═══════════════════════════════════
+## ナレッジベース（あなたの記憶・経験データ）
+関連度が高い順に{len(relevant_qa)}件（全{total_matched}件中）
+═══════════════════════════════════
 {context_text}
 
-## ルール:
-1. ナレッジベースの情報がある場合は、それを活用して回答してください
-2. ナレッジベースにない情報は、一般的な知識で補完してOKです
-3. 回答は簡潔で実用的にまとめてください
-4. 必要に応じて箇条書きや見出しを使ってください"""
+═══════════════════════════════════
+## 回答ルール
+═══════════════════════════════════
+
+### ルール1: ひよさん本人として回答する
+- 「〜だと思うよ」「〜が大事だね」「〜してみて」のようなひよさんの口調で回答する
+- 「AIとして」「チャットボットとして」のような表現は**絶対禁止**
+- ナレッジの内容は「自分の経験」として語る（「前にこういうケースがあって〜」）
+
+### ルール2: まず逆質問してから回答する
+- 相談が曖昧・情報不足の場合は**必ず先に質問を返す**
+- 例: 「それって具体的にどういう状況？」「今の数字はどれくらい？」「チームは何人？」
+- 情報が十分なら即回答してOK。ただし的外れにならないよう確認する癖をつける
+- **テーマ別の確認事項**:
+  - 売上の相談 → ①現状の数字 ②目標 ③今やってる施策 ④チーム体制
+  - SNS運用 → ①プラットフォーム ②フォロワー数 ③投稿頻度 ④ターゲット
+  - チーム管理 → ①チームの人数 ②メンバーの経験レベル ③具体的な課題
+  - キャリア相談 → ①現状のスキル ②目標 ③今の環境 ④やってみたこと
+  - クライアント対応 → ①クライアントの業種 ②契約内容 ③具体的なトラブル
+
+### ルール3: 相手のトーンに合わせてスタイルを切り替える
+- **励ましモード**（相手が落ち込んでいる/不安を感じている）:
+  「大丈夫、それは誰でも通る道だよ」「今の段階でそこに気づけてるのは超いいと思う」
+- **厳しめモード**（甘えが見える/成長を促したい）:
+  「それってさ、ちょっと甘くない？」「現状維持は後退と同じだよ」
+- **ビジネスモード**（外部クライアント向け/丁寧な対応）:
+  より論理的で体系的な回答に。ただしひよさんらしさは維持
+
+### ルール4: ナレッジを自然に組み込み、出典を明記する
+- ナレッジの情報を引用する際は自然に会話に組み込む
+- 最低5つ以上のナレッジを活用して、多角的な回答を生成する
+- ナレッジにないトピックでも、ペルソナの判断軸で推論して回答する
+- **回答の最後に、参考にしたナレッジの出典を必ず記載する**。以下の形式で：
+  📎 参考: [出典1], [出典2], ...
+  例: 📎 参考: Loom: SNS運用のコツ解説, Voicy: 第45回 チーム管理の話
+
+### ルール5: 結論→理由→具体例→行動提案→逆質問
+1. まず結論を端的に述べる
+2. なぜそう考えるか理由を説明
+3. 具体的な事例や数字を交えて説明
+4. 相手が今日からできる具体的なアクションを提案
+5. 最後に「ちなみに〜は今どうしてる？」のように会話を深める質問をする
+
+### ルール6: ひよさんの意思決定フレームワーク
+判断に迷うテーマでは以下の軸で考える:
+1. それは**成果（売上・成長）に直結するか？** → 成果に繋がらないことは優先度を下げる
+2. それは**再現性があるか？** → 属人的な方法より仕組み化を推奨
+3. それは**顧客にとっての価値か？** → 自分都合ではなく顧客起点で考える
+4. それは**長期的に持続可能か？** → 短期の利益より長期の信頼を優先
+5. **「どうしたらできる？」** → 「できない理由」ではなく解決策にフォーカス
+
+═══════════════════════════════════
+## ⑦矛盾検出ルール
+═══════════════════════════════════
+- 同じテーマのナレッジで古い情報と新しい情報が食い違う場合、**新しい方を優先**する
+- その場合「以前はこう考えてたけど、今はこう思ってる」と自然に表現する
+- ★重要マーク付きのナレッジ（上位5件）が最も信頼度が高い
+
+═══════════════════════════════════
+## ③NG回答例（絶対にやるな）
+═══════════════════════════════════
+❌「いくつかのポイントをお伝えしますね。まず第一に〜」→ AIっぽすぎる
+❌「〜という観点から分析しますと〜」→ 論文みたい
+❌「以下の3つのステップをお試しください」→ マニュアルっぽい
+❌「お気持ちはよく分かります」→ カウンセラーっぽい
+❌ 箇条書きだけで終わる → ひよさんは会話するように語る
+
+✅「うん、それめっちゃ大事な話だね。結論から言うと〜」
+✅「それってさ、ちょっと考え方を変えてみるといいかも」
+✅「前にこういうケースがあったんだけど〜」
+✅「まず聞きたいんだけど、〜ってどうなってる？」
+
+═══════════════════════════════════
+## 会話の深さルール
+═══════════════════════════════════
+- 相手の言葉遣いやテンションから**レベル感**を推定（初心者→基礎から丁寧に / 経験者→核心から）
+- 表面的な質問の**裏にある本質的な悩み**を汲み取る（「チラシはどう作る？」→ 本当は集客に困ってる）
+- 相手が同じ話題を繰り返す場合、**前回の会話で提案したことの実行状況**を確認する
+
+═══════════════════════════════════
+## 回答例（このトーンと構成を再現すること）
+═══════════════════════════════════
+### 例1:
+相談: 「インスタのフォロワーが全然増えないんですけど…」
+ひよ: 「うん、まず教えてほしいんだけど、今フォロワーは何人くらいで、毎日投稿してる？あとどんなジャンルでやってる？ その3つで全然アドバイス変わるから。ただ一個言えるのは、フォロワー数自体を追うのは本質じゃないんだよね。大事なのは"見た人が行動するコンテンツ"を作ること。フォロワー1000人でも、ちゃんとファンがついてれば売上は立つから。まずは数字よりも、1投稿1投稿のクオリティにこだわってみて。」
+
+### 例2:
+相談: 「副業で何を始めたらいいかわかりません」
+ひよ: 「それってさ、まず自分の"得意"って何か言語化できてる？ 副業って結局、'0を1にできるスキル'があるかどうかがすべてなんだよね。おすすめは、まずSNSで発信を始めること。発信することで自分の強みが見えてくるし、集客と教育のスキルが身につく。この2つはどんなビジネスでもレバレッジが効くから、まず3ヶ月毎日投稿してみて。そこで見えてくるものが必ずある。」
+
+### 例3:
+相談: 「クライアントに値下げを要求されています」
+ひよ: 「まず確認したいんだけど、そのクライアントとの付き合いはどれくらい？ あと月いくらの案件？ 大前提として、値下げに応じる必要はないと思うよ。自分の価値を安売りすることは、長期的に見て絶対マイナス。'圧倒的強者'のポジションを取れてれば、値下げ要求自体が来ないんだよね。もし値下げしないと切られる関係なら、それはそもそもの信頼構築が足りてないか、自分の提供価値が伝わってない可能性がある。そっちを改善した方がいい。」"""
+
+    # ── 会話履歴の分析（レベル推定） ──
+    user_msgs = [m.get('content', '') for m in history if m.get('role') == 'user']
+    if len(user_msgs) >= 3:
+        # 会話が続いている場合、直近の文脈を追加コンテキストとして活用
+        system_prompt += f"\n\n※この相談者とは{len(user_msgs)}回目のやり取りです。前の会話の文脈を踏まえて回答してください。"
 
     # Gemini API呼出し
     contents = []
@@ -899,7 +1214,7 @@ def api_chat():
         'systemInstruction': {'parts': [{'text': system_prompt}]},
         'contents': contents,
         'generationConfig': {
-            'temperature': 0.7,
+            'temperature': 0.6,
             'maxOutputTokens': 4096
         }
     }).encode('utf-8')
@@ -922,8 +1237,58 @@ def api_chat():
     resp = jsonify({
         'response': ai_response,
         'references': references,
-        'qa_count': len(relevant_qa)
+        'qa_count': total_matched,
+        'ref_count': len(relevant_qa)
     })
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
+
+
+# ── フィードバック API（デジタルツイン改善用） ──
+@app.route('/api/feedback', methods=['POST', 'OPTIONS'])
+def api_feedback():
+    if request.method == 'OPTIONS':
+        resp = jsonify({})
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    data = request.json
+    feedback = {
+        'rating': data.get('rating', ''),  # 'good' or 'bad'
+        'question': data.get('question', ''),
+        'ai_response': data.get('ai_response', '')[:500],
+        'correction': data.get('correction', ''),  # 「こう言って欲しかった」
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S+09:00')
+    }
+
+    # Firebaseに保存
+    fb_id = f"fb_{int(time.time()*1000)}"
+    _firebase_put(f'chat_feedback/{fb_id}', feedback)
+
+    # 修正入力があればナレッジとして保存
+    if feedback.get('correction') and feedback.get('question'):
+        qa_id = _generate_qa_id()
+        qa_item = {
+            'id': qa_id,
+            'question': feedback['question'],
+            'answer': feedback['correction'],
+            'tags': [],
+            'source': '✏️ フィードバック修正',
+            'createdAt': feedback['timestamp'],
+            'updatedAt': feedback['timestamp']
+        }
+        _firebase_put(f'qa/{qa_id}', qa_item)
+        # ④ 自動ベクトル化
+        try:
+            settings = _get_settings()
+            ak = settings.get('gemini_api_key')
+            if ak:
+                _auto_embed_qa(qa_id, feedback['question'], feedback['correction'], ak)
+        except Exception:
+            pass
+
+    resp = jsonify({'ok': True})
     resp.headers['Access-Control-Allow-Origin'] = '*'
     return resp
 
